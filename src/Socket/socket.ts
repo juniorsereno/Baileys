@@ -15,6 +15,7 @@ import {
 } from '../Defaults'
 import {
 	type LIDMapping,
+	type MediaConnInfo,
 	type NewChatMessageCapInfo,
 	QueryIds,
 	ReachoutTimelockEnforcementType,
@@ -30,6 +31,7 @@ import {
 	bytesToCrockford,
 	configureSuccessfulPairing,
 	Curve,
+	DEF_MEDIA_HOST,
 	derivePairingCodeKey,
 	generateLoginNode,
 	generateMdTagPrefix,
@@ -44,6 +46,7 @@ import {
 	signedKeyPair,
 	xmppSignedPreKey
 } from '../Utils'
+import { makeMutex } from '../Utils/make-mutex'
 import {
 	assertNodeErrorFree,
 	type BinaryNode,
@@ -233,6 +236,46 @@ export const makeSocket = (config: SocketConfig) => {
 
 		return result
 	}
+
+	let mediaConn: MediaConnInfo | undefined
+	let mediaHost: string = DEF_MEDIA_HOST
+	const mediaConnMutex = makeMutex()
+
+	const refreshMediaConn = (forceGet = false): Promise<MediaConnInfo> =>
+		mediaConnMutex.mutex(async () => {
+			if (mediaConn && !forceGet && Date.now() - mediaConn.fetchDate.getTime() <= mediaConn.ttl * 1000) {
+				return mediaConn
+			}
+
+			const result = await query({
+				tag: 'iq',
+				attrs: {
+					type: 'set',
+					xmlns: 'w:m',
+					to: S_WHATSAPP_NET
+				},
+				content: [{ tag: 'media_conn', attrs: {} }]
+			})
+			const mediaConnNode = getBinaryNodeChild(result, 'media_conn')!
+			const node: MediaConnInfo = {
+				hosts: getBinaryNodeChildren(mediaConnNode, 'host').map(({ attrs }) => ({
+					hostname: attrs.hostname!,
+					maxContentLengthBytes: +attrs.maxContentLengthBytes!
+				})),
+				auth: mediaConnNode.attrs.auth!,
+				ttl: +mediaConnNode.attrs.ttl!,
+				fetchDate: new Date()
+			}
+			logger.debug('fetched media conn')
+			if (node.hosts[0]) {
+				mediaHost = node.hosts[0].hostname
+			}
+
+			mediaConn = node
+			return node
+		})
+
+	const getMediaHost = () => mediaHost
 
 	// Validate current key-bundle on server; on failure, trigger pre-key upload and rethrow
 	const digestKeyBundle = async (): Promise<void> => {
@@ -631,6 +674,7 @@ export const makeSocket = (config: SocketConfig) => {
 		}
 
 		closed = true
+		mediaConn = undefined
 		logger.info({ trace: error?.stack }, error ? 'connection errored' : 'connection closed')
 
 		clearInterval(keepAliveReq)
@@ -945,6 +989,12 @@ export const makeSocket = (config: SocketConfig) => {
 			} catch (e) {
 				logger.warn({ e }, 'failed to run digest after login')
 			}
+
+			try {
+				await refreshMediaConn()
+			} catch (err) {
+				logger.warn({ err }, 'failed to pre-fetch media_conn on socket open')
+			}
 		} catch (err) {
 			logger.warn({ err }, 'failed to send initial passive iq')
 		}
@@ -1175,6 +1225,8 @@ export const makeSocket = (config: SocketConfig) => {
 		uploadPreKeysToServerIfRequired,
 		digestKeyBundle,
 		rotateSignedPreKey,
+		refreshMediaConn,
+		getMediaHost,
 		requestPairingCode,
 		updateServerTimeOffset,
 		sendUnifiedSession,
