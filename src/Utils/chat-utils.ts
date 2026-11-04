@@ -351,7 +351,7 @@ export const decodeSyncdPatch = async (
 	return result
 }
 
-export const extractSyncdPatches = async (result: BinaryNode, options: RequestInit) => {
+export const extractSyncdPatches = async (result: BinaryNode, options: RequestInit, host?: string) => {
 	const syncNode = getBinaryNodeChild(result, 'sync')
 	const collectionNodes = getBinaryNodeChildren(syncNode, 'collection')
 
@@ -377,7 +377,7 @@ export const extractSyncdPatches = async (result: BinaryNode, options: RequestIn
 				}
 
 				const blobRef = proto.ExternalBlobReference.decode(snapshotNode.content as Buffer)
-				const data = await downloadExternalBlob(blobRef, options)
+				const data = await downloadExternalBlob(blobRef, options, host)
 				snapshot = proto.SyncdSnapshot.decode(data)
 			}
 
@@ -403,8 +403,8 @@ export const extractSyncdPatches = async (result: BinaryNode, options: RequestIn
 	return final
 }
 
-export const downloadExternalBlob = async (blob: proto.IExternalBlobReference, options: RequestInit) => {
-	const stream = await downloadContentFromMessage(blob, 'md-app-state', { options })
+export const downloadExternalBlob = async (blob: proto.IExternalBlobReference, options: RequestInit, host?: string) => {
+	const stream = await downloadContentFromMessage(blob, 'md-app-state', { options, host })
 	const bufferArray: Buffer[] = []
 	for await (const chunk of stream) {
 		bufferArray.push(chunk)
@@ -413,8 +413,12 @@ export const downloadExternalBlob = async (blob: proto.IExternalBlobReference, o
 	return Buffer.concat(bufferArray)
 }
 
-export const downloadExternalPatch = async (blob: proto.IExternalBlobReference, options: RequestInit) => {
-	const buffer = await downloadExternalBlob(blob, options)
+export const downloadExternalPatch = async (
+	blob: proto.IExternalBlobReference,
+	options: RequestInit,
+	host?: string
+) => {
+	const buffer = await downloadExternalBlob(blob, options, host)
 	const syncData = proto.SyncdMutations.decode(buffer)
 	return syncData
 }
@@ -484,7 +488,8 @@ export const decodePatches = async (
 	options: RequestInit,
 	minimumVersionNumber?: number,
 	logger?: ILogger,
-	validateMacs = true
+	validateMacs = true,
+	host?: string
 ) => {
 	const newState: LTHashState = {
 		...initial,
@@ -497,7 +502,7 @@ export const decodePatches = async (
 		const { version, keyId, snapshotMac } = syncd
 		if (syncd.externalMutations) {
 			logger?.trace({ name, version }, 'downloading external patch')
-			const ref = await downloadExternalPatch(syncd.externalMutations, options)
+			const ref = await downloadExternalPatch(syncd.externalMutations, options, host)
 			logger?.debug({ name, version, mutations: ref.mutations.length }, 'downloaded external patch')
 			syncd.mutations?.push(...ref.mutations)
 		}

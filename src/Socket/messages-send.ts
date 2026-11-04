@@ -4,7 +4,6 @@ import { proto } from '../../WAProto/index.js'
 import { DEFAULT_CACHE_TTLS, WA_DEFAULT_EPHEMERAL } from '../Defaults'
 import type {
 	AnyMessageContent,
-	MediaConnInfo,
 	MessageReceiptType,
 	MessageRelayOptions,
 	MiscMessageGenerationOptions,
@@ -18,7 +17,8 @@ import {
 	assertMeId,
 	bindWaitForEvent,
 	decryptMediaRetryData,
-	DEF_MEDIA_HOST,
+	downloadContentFromMessage,
+	downloadMediaMessage,
 	encodeNewsletterMessage,
 	encodeSignedDeviceIdentity,
 	encodeWAMessage,
@@ -51,8 +51,6 @@ import {
 	type BinaryNode,
 	type BinaryNodeAttributes,
 	type FullJid,
-	getBinaryNodeChild,
-	getBinaryNodeChildren,
 	isHostedLidUser,
 	isHostedPnUser,
 	isJidBot,
@@ -93,7 +91,9 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		sendNode,
 		groupMetadata,
 		groupToggleEphemeral,
-		registerSocketEndHandler
+		registerSocketEndHandler,
+		refreshMediaConn,
+		getMediaHost
 	} = sock
 
 	const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
@@ -119,45 +119,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 	// Prevent race conditions in Signal session encryption by user
 	const encryptionMutex = makeKeyedMutex()
-
-	let mediaConn: Promise<MediaConnInfo> | undefined
-	/** Per-socket media host; updated whenever media_conn is fetched. Defaults to the public WhatsApp host. */
-	let mediaHost: string = DEF_MEDIA_HOST
-	const refreshMediaConn = async (forceGet = false): Promise<MediaConnInfo> => {
-		const media = await mediaConn
-		if (!media || forceGet || new Date().getTime() - media.fetchDate.getTime() > media.ttl * 1000) {
-			mediaConn = (async () => {
-				const result = await query({
-					tag: 'iq',
-					attrs: {
-						type: 'set',
-						xmlns: 'w:m',
-						to: S_WHATSAPP_NET
-					},
-					content: [{ tag: 'media_conn', attrs: {} }]
-				})
-				const mediaConnNode = getBinaryNodeChild(result, 'media_conn')!
-				// TODO: explore full length of data that whatsapp provides
-				const node: MediaConnInfo = {
-					hosts: getBinaryNodeChildren(mediaConnNode, 'host').map(({ attrs }) => ({
-						hostname: attrs.hostname!,
-						maxContentLengthBytes: +attrs.maxContentLengthBytes!
-					})),
-					auth: mediaConnNode.attrs.auth!,
-					ttl: +mediaConnNode.attrs.ttl!,
-					fetchDate: new Date()
-				}
-				logger.debug('fetched media conn')
-				if (node.hosts[0]) {
-					mediaHost = node.hosts[0].hostname
-				}
-
-				return node
-			})()
-		}
-
-		return mediaConn!
-	}
 
 	/**
 	 * generic send receipt function
@@ -1252,11 +1213,17 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			userDevicesCache.close()
 		}
 
-		mediaConn = undefined
 		if (messageRetryManager) {
 			messageRetryManager.clear()
 		}
 	})
+
+	const downloadMediaMessageWithHost = <Type extends 'buffer' | 'stream'>(
+		...[message, type, options, ctx]: Parameters<typeof downloadMediaMessage<Type>>
+	) => downloadMediaMessage<Type>(message, type, { ...options, host: options?.host ?? getMediaHost() }, ctx)
+
+	const downloadContentFromMessageWithHost: typeof downloadContentFromMessage = (message, type, opts = {}) =>
+		downloadContentFromMessage(message, type, { ...opts, host: opts.host ?? getMediaHost() })
 
 	return {
 		...sock,
@@ -1269,8 +1236,10 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		sendReceipts,
 		readMessages,
 		refreshMediaConn,
-		// Function (not getter) so the spread in chats.ts preserves the live closure binding.
-		getMediaHost: () => mediaHost,
+		getMediaHost,
+		getMediaUrl: (directPath: string) => getUrlFromDirectPath(directPath, getMediaHost()),
+		downloadMediaMessage: downloadMediaMessageWithHost,
+		downloadContentFromMessage: downloadContentFromMessageWithHost,
 		waUploadToServer,
 		fetchPrivacySettings,
 		sendPeerDataOperationMessage,
@@ -1304,7 +1273,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 								}
 
 								content.directPath = media.directPath
-								content.url = getUrlFromDirectPath(content.directPath!, mediaHost)
+								content.url = getUrlFromDirectPath(content.directPath!, getMediaHost())
 
 								logger.debug({ directPath: media.directPath, key: result.key }, 'media update successful')
 							} catch (err: any) {

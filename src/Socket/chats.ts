@@ -97,7 +97,8 @@ export const makeChatsSocket = (config: SocketConfig) => {
 		signalRepository,
 		onUnexpectedError,
 		sendUnifiedSession,
-		registerSocketEndHandler
+		registerSocketEndHandler,
+		getMediaHost
 	} = sock
 
 	const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
@@ -644,7 +645,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 					})
 
 					// extract from binary node
-					const decoded = await extractSyncdPatches(result, config?.options)
+					const decoded = await extractSyncdPatches(result, config?.options, getMediaHost())
 					for (const key in decoded) {
 						const name = key as WAPatchName
 						const { patches, hasMorePatches, snapshot } = decoded[name]
@@ -676,7 +677,8 @@ export const makeChatsSocket = (config: SocketConfig) => {
 									config.options,
 									initialVersionMap[name],
 									logger,
-									appStateMacVerification.patch
+									appStateMacVerification.patch,
+									getMediaHost()
 								)
 
 								await authState.keys.set({ 'app-state-sync-version': { [name]: newState } })
@@ -975,7 +977,9 @@ export const makeChatsSocket = (config: SocketConfig) => {
 				getAppStateSyncKey,
 				config.options,
 				undefined,
-				logger
+				logger,
+				undefined,
+				getMediaHost()
 			)
 			for (const key in mutationMap) {
 				onMutation(mutationMap[key]!)
@@ -1325,7 +1329,8 @@ export const makeChatsSocket = (config: SocketConfig) => {
 				keyStore: authState.keys,
 				logger,
 				options: config.options,
-				getMessage
+				getMessage,
+				getMediaHost
 			})
 		])
 
