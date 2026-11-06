@@ -15,6 +15,29 @@ const makeTestLogger = (): ILogger =>
 	}) as unknown as ILogger
 
 describe('event-buffer', () => {
+	it('retains messages buffered synchronously by a flush listener', () => {
+		const ev = makeEventBuffer(makeTestLogger())
+		const ids: string[] = []
+		ev.on('messages.upsert', ({ messages }) => {
+			for (const message of messages) ids.push(message.key.id!)
+			if (messages.some(message => message.key.id === 'first')) {
+				ev.buffer()
+				ev.emit('messages.upsert', {
+					type: 'notify',
+					messages: [{ key: { id: 'second', remoteJid: '123@s.whatsapp.net' }, message: { conversation: 'second' } }]
+				})
+			}
+		})
+		ev.buffer()
+		ev.emit('messages.upsert', {
+			type: 'notify',
+			messages: [{ key: { id: 'first', remoteJid: '123@s.whatsapp.net' }, message: { conversation: 'first' } }]
+		})
+		ev.flush()
+		ev.flush()
+		expect(ids).toEqual(['first', 'second'])
+	})
+
 	describe('messaging-history.set pastParticipants buffering', () => {
 		it('should include pastParticipants in flushed event', async () => {
 			const logger = makeTestLogger()
