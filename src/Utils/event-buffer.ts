@@ -149,11 +149,11 @@ export const makeEventBuffer = (logger: ILogger): BaileysBufferableEventEmitter 
 		}
 
 		const consolidatedData = consolidateEvents(data)
+		// Reentrant listeners must write into the next buffer.
+		data = newData
 		if (Object.keys(consolidatedData).length) {
 			ev.emit('event', consolidatedData)
 		}
-
-		data = newData
 
 		logger.trace({ conditionalChatUpdatesLeft }, 'released buffered events')
 
