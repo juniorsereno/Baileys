@@ -87,6 +87,7 @@ export function makeCacheableSignalKeyStore(
 		},
 		async set(data) {
 			return cacheMutex.runExclusive(async () => {
+				await store.set(data)
 				let keys = 0
 				for (const type in data) {
 					for (const id in data[type as keyof SignalDataTypeMap]) {
@@ -96,7 +97,6 @@ export function makeCacheableSignalKeyStore(
 				}
 
 				logger?.trace({ keys }, 'updated cache')
-				await store.set(data)
 			})
 		},
 		async clear() {
