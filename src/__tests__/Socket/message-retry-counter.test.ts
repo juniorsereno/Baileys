@@ -218,3 +218,36 @@ test('a receipt for an unavailable message does not consume a resend attempt', a
 	expect(relay).not.toHaveBeenCalled()
 	expect(cache.get(`retry-example:${peer}`)).toBe(2)
 })
+
+test('a retry cannot consume a prekey from an upload awaiting acknowledgement', async () => {
+	const { sock, transport, cache } = await createSocket(false)
+	cache.set('retry-example:undefined', 2)
+	transport.hold = true
+	const sent = new Promise<void>(resolve => {
+		transport.onUpload = resolve
+	})
+	const upload = sock.uploadPreKeys(2)
+	await sent
+	const uploadNode = transport.uploads.find(n => n.tag === 'iq')!
+	const transaction = jest.spyOn(sock.authState.keys, 'transaction')
+	const set = cache.set.bind(cache)
+	const reserved = new Promise<void>(resolve => {
+		jest.spyOn(cache, 'set').mockImplementation((key, value, ttl) => {
+			const result = set(key, value, ttl)
+			resolve()
+			return result
+		})
+	})
+	const retry = sock.sendRetryRequest(node)
+	await reserved
+	await new Promise<void>(resolve => setImmediate(resolve))
+	const earlyTransactions = transaction.mock.calls.length
+	transport.ack(uploadNode)
+	await Promise.all([upload, retry])
+	expect(earlyTransactions).toBe(0)
+	const receipt = transport.uploads.find(n => n.tag === 'receipt' && n.attrs.type === 'retry')!
+	const key = getBinaryNodeChild(getBinaryNodeChild(receipt, 'keys'), 'key')
+	const id = getBinaryNodeChild(key, 'id')?.content
+	if (!(id instanceof Uint8Array)) throw new Error('Expected retry prekey')
+	expect(Buffer.from(id).readUIntBE(0, id.length)).toBe(3)
+})

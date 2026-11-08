@@ -530,6 +530,7 @@ export const makeSocket = (config: SocketConfig) => {
 
 	// WAWeb has no time throttle here; the server drives uploads via PreKeyLow notifications.
 	let uploadPreKeysPromise: Promise<void> | null = null
+	const preKeyMutex = makeMutex()
 
 	/** generates and uploads a set of pre-keys to the server */
 	const uploadPreKeys = async (count = MIN_PREKEY_COUNT) => {
@@ -587,7 +588,7 @@ export const makeSocket = (config: SocketConfig) => {
 
 		let timeout: ReturnType<typeof setTimeout> | undefined
 		uploadPreKeysPromise = Promise.race([
-			uploadLogic(),
+			preKeyMutex.mutex(uploadLogic),
 			new Promise<void>((_, reject) => {
 				timeout = setTimeout(() => {
 					expired = true
@@ -1241,6 +1242,7 @@ export const makeSocket = (config: SocketConfig) => {
 		end,
 		registerSocketEndHandler,
 		onUnexpectedError,
+		preKeyMutex,
 		uploadPreKeys,
 		uploadPreKeysToServerIfRequired,
 		digestKeyBundle,

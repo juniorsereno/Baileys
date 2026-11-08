@@ -130,6 +130,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		relayMessage,
 		sendReceipt,
 		uploadPreKeys,
+		preKeyMutex,
 		sendPeerDataOperationMessage,
 		messageRetryManager,
 		registerSocketEndHandler,
@@ -651,68 +652,70 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 
 		const deviceIdentity = encodeSignedDeviceIdentity(account!, true)
-		await authState.keys.transaction(async () => {
-			const receipt: BinaryNode = {
-				tag: 'receipt',
-				attrs: {
-					id: msgId,
-					type: 'retry',
-					to: node.attrs.from!
-				},
-				content: [
-					{
-						tag: 'retry',
-						attrs: {
-							count: retryCount.toString(),
-							id: node.attrs.id!,
-							t: node.attrs.t!,
-							v: '1',
-							// ADD ERROR FIELD
-							error: '0'
-						}
+		await preKeyMutex.mutex(() =>
+			authState.keys.transaction(async () => {
+				const receipt: BinaryNode = {
+					tag: 'receipt',
+					attrs: {
+						id: msgId,
+						type: 'retry',
+						to: node.attrs.from!
 					},
-					{
-						tag: 'registration',
-						attrs: {},
-						content: encodeBigEndian(authState.creds.registrationId)
-					}
-				]
-			}
-
-			if (node.attrs.recipient) {
-				receipt.attrs.recipient = node.attrs.recipient
-			}
-
-			if (node.attrs.participant) {
-				receipt.attrs.participant = node.attrs.participant
-			}
-
-			if (retryCount > 1 || forceIncludeKeys || shouldRecreateSession) {
-				const { update, preKeys } = await getNextPreKeys(authState, 1)
-
-				const [keyId] = Object.keys(preKeys)
-				const key = preKeys[+keyId!]
-
-				const content = receipt.content! as BinaryNode[]
-				content.push({
-					tag: 'keys',
-					attrs: {},
 					content: [
-						{ tag: 'type', attrs: {}, content: Buffer.from(KEY_BUNDLE_TYPE) },
-						{ tag: 'identity', attrs: {}, content: identityKey.public },
-						xmppPreKey(key!, +keyId!),
-						xmppSignedPreKey(signedPreKey),
-						{ tag: 'device-identity', attrs: {}, content: deviceIdentity }
+						{
+							tag: 'retry',
+							attrs: {
+								count: retryCount.toString(),
+								id: node.attrs.id!,
+								t: node.attrs.t!,
+								v: '1',
+								// ADD ERROR FIELD
+								error: '0'
+							}
+						},
+						{
+							tag: 'registration',
+							attrs: {},
+							content: encodeBigEndian(authState.creds.registrationId)
+						}
 					]
-				})
+				}
 
-				ev.emit('creds.update', update)
-			}
+				if (node.attrs.recipient) {
+					receipt.attrs.recipient = node.attrs.recipient
+				}
 
-			await sendNode(receipt)
+				if (node.attrs.participant) {
+					receipt.attrs.participant = node.attrs.participant
+				}
 
-			logger.info({ msgAttrs: node.attrs, retryCount }, 'sent retry receipt')
-		}, authState?.creds?.me?.id || 'sendRetryRequest')
+				if (retryCount > 1 || forceIncludeKeys || shouldRecreateSession) {
+					const { update, preKeys } = await getNextPreKeys(authState, 1)
+
+					const [keyId] = Object.keys(preKeys)
+					const key = preKeys[+keyId!]
+
+					const content = receipt.content! as BinaryNode[]
+					content.push({
+						tag: 'keys',
+						attrs: {},
+						content: [
+							{ tag: 'type', attrs: {}, content: Buffer.from(KEY_BUNDLE_TYPE) },
+							{ tag: 'identity', attrs: {}, content: identityKey.public },
+							xmppPreKey(key!, +keyId!),
+							xmppSignedPreKey(signedPreKey),
+							{ tag: 'device-identity', attrs: {}, content: deviceIdentity }
+						]
+					})
+
+					ev.emit('creds.update', update)
+				}
+
+				await sendNode(receipt)
+
+				logger.info({ msgAttrs: node.attrs, retryCount }, 'sent retry receipt')
+			}, authState?.creds?.me?.id || 'sendRetryRequest')
+		)
 	}
 
 	// Mirrors WAWeb/Handle/PreKeyLow.js: skip a re-issued notification with the same stanza id.
