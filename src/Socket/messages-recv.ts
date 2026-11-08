@@ -53,7 +53,7 @@ import {
 	xmppPreKey,
 	xmppSignedPreKey
 } from '../Utils'
-import { makeMutex } from '../Utils/make-mutex'
+import { makeKeyedMutex, makeMutex } from '../Utils/make-mutex'
 import { makeOfflineNodeProcessor, type MessageType } from '../Utils/offline-node-processor'
 import { buildAckStanza } from '../Utils/stanza-ack'
 import {
@@ -130,6 +130,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		relayMessage,
 		sendReceipt,
 		uploadPreKeys,
+		preKeyMutex,
 		sendPeerDataOperationMessage,
 		messageRetryManager,
 		registerSocketEndHandler,
@@ -149,6 +150,26 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			stdTTL: DEFAULT_CACHE_TTLS.MSG_RETRY, // 1 hour
 			useClones: false
 		})
+	// Both received retry requests and outbound resends update this cache.
+	const retryCounterMutex = makeKeyedMutex()
+	const reserveRetry = async (id: string, participant: string, received = false): Promise<number | undefined> =>
+		retryCounterMutex.mutex(id, async () => {
+			const key = `${id}:${participant}`
+			const current = Math.max(
+				(await msgRetryCache.get<number>(key)) || 0,
+				received ? messageRetryManager?.getRetryCount(id) || 0 : 0
+			)
+			if (current >= maxMsgRetryCount) {
+				if (received) messageRetryManager?.markRetryFailed(id)
+				return undefined
+			}
+
+			const next = current + 1
+			await msgRetryCache.set(key, next)
+			if (received) messageRetryManager?.incrementRetryCount(id)
+			return next
+		})
+
 	const callOfferCache =
 		config.callOfferCache ||
 		new NodeCache<WACallEvent>({
@@ -576,36 +597,11 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		const { key: msgKey } = fullMessage
 		const msgId = msgKey.id!
 
-		if (messageRetryManager) {
-			// Check if we've exceeded max retries using the new system
-			if (messageRetryManager.hasExceededMaxRetries(msgId)) {
-				logger.debug({ msgId }, 'reached retry limit with new retry manager, clearing')
-				messageRetryManager.markRetryFailed(msgId)
-				return
-			}
-
-			// Increment retry count using new system
-			const retryCount = messageRetryManager.incrementRetryCount(msgId)
-
-			// Use the new retry count for the rest of the logic
-			const key = `${msgId}:${msgKey?.participant}`
-			await msgRetryCache.set(key, retryCount)
-		} else {
-			// Fallback to old system
-			const key = `${msgId}:${msgKey?.participant}`
-			let retryCount = (await msgRetryCache.get<number>(key)) || 0
-			if (retryCount >= maxMsgRetryCount) {
-				logger.debug({ retryCount, msgId }, 'reached retry limit, clearing')
-				await msgRetryCache.del(key)
-				return
-			}
-
-			retryCount += 1
-			await msgRetryCache.set(key, retryCount)
+		const retryCount = await reserveRetry(msgId, String(msgKey.participant), true)
+		if (retryCount === undefined) {
+			logger.debug({ msgId }, 'reached retry limit')
+			return
 		}
-
-		const key = `${msgId}:${msgKey?.participant}`
-		const retryCount = (await msgRetryCache.get<number>(key)) || 1
 
 		const { account, signedPreKey, signedIdentityKey: identityKey } = authState.creds
 		const fromJid = node.attrs.from!
@@ -656,68 +652,70 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 
 		const deviceIdentity = encodeSignedDeviceIdentity(account!, true)
-		await authState.keys.transaction(async () => {
-			const receipt: BinaryNode = {
-				tag: 'receipt',
-				attrs: {
-					id: msgId,
-					type: 'retry',
-					to: node.attrs.from!
-				},
-				content: [
-					{
-						tag: 'retry',
-						attrs: {
-							count: retryCount.toString(),
-							id: node.attrs.id!,
-							t: node.attrs.t!,
-							v: '1',
-							// ADD ERROR FIELD
-							error: '0'
-						}
+		await preKeyMutex.mutex(() =>
+			authState.keys.transaction(async () => {
+				const receipt: BinaryNode = {
+					tag: 'receipt',
+					attrs: {
+						id: msgId,
+						type: 'retry',
+						to: node.attrs.from!
 					},
-					{
-						tag: 'registration',
-						attrs: {},
-						content: encodeBigEndian(authState.creds.registrationId)
-					}
-				]
-			}
-
-			if (node.attrs.recipient) {
-				receipt.attrs.recipient = node.attrs.recipient
-			}
-
-			if (node.attrs.participant) {
-				receipt.attrs.participant = node.attrs.participant
-			}
-
-			if (retryCount > 1 || forceIncludeKeys || shouldRecreateSession) {
-				const { update, preKeys } = await getNextPreKeys(authState, 1)
-
-				const [keyId] = Object.keys(preKeys)
-				const key = preKeys[+keyId!]
-
-				const content = receipt.content! as BinaryNode[]
-				content.push({
-					tag: 'keys',
-					attrs: {},
 					content: [
-						{ tag: 'type', attrs: {}, content: Buffer.from(KEY_BUNDLE_TYPE) },
-						{ tag: 'identity', attrs: {}, content: identityKey.public },
-						xmppPreKey(key!, +keyId!),
-						xmppSignedPreKey(signedPreKey),
-						{ tag: 'device-identity', attrs: {}, content: deviceIdentity }
+						{
+							tag: 'retry',
+							attrs: {
+								count: retryCount.toString(),
+								id: node.attrs.id!,
+								t: node.attrs.t!,
+								v: '1',
+								// ADD ERROR FIELD
+								error: '0'
+							}
+						},
+						{
+							tag: 'registration',
+							attrs: {},
+							content: encodeBigEndian(authState.creds.registrationId)
+						}
 					]
-				})
+				}
 
-				ev.emit('creds.update', update)
-			}
+				if (node.attrs.recipient) {
+					receipt.attrs.recipient = node.attrs.recipient
+				}
 
-			await sendNode(receipt)
+				if (node.attrs.participant) {
+					receipt.attrs.participant = node.attrs.participant
+				}
 
-			logger.info({ msgAttrs: node.attrs, retryCount }, 'sent retry receipt')
-		}, authState?.creds?.me?.id || 'sendRetryRequest')
+				if (retryCount > 1 || forceIncludeKeys || shouldRecreateSession) {
+					const { update, preKeys } = await getNextPreKeys(authState, 1)
+
+					const [keyId] = Object.keys(preKeys)
+					const key = preKeys[+keyId!]
+
+					const content = receipt.content! as BinaryNode[]
+					content.push({
+						tag: 'keys',
+						attrs: {},
+						content: [
+							{ tag: 'type', attrs: {}, content: Buffer.from(KEY_BUNDLE_TYPE) },
+							{ tag: 'identity', attrs: {}, content: identityKey.public },
+							xmppPreKey(key!, +keyId!),
+							xmppSignedPreKey(signedPreKey),
+							{ tag: 'device-identity', attrs: {}, content: deviceIdentity }
+						]
+					})
+
+					ev.emit('creds.update', update)
+				}
+
+				await sendNode(receipt)
+
+				logger.info({ msgAttrs: node.attrs, retryCount }, 'sent retry receipt')
+			}, authState?.creds?.me?.id || 'sendRetryRequest')
+		)
 	}
 
 	// Mirrors WAWeb/Handle/PreKeyLow.js: skip a re-issued notification with the same stanza id.
@@ -1305,12 +1303,6 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		return retryCount < maxMsgRetryCount
 	}
 
-	const updateSendMessageAgainCount = async (id: string, participant: string) => {
-		const key = `${id}:${participant}`
-		const newValue = ((await msgRetryCache.get<number>(key)) || 0) + 1
-		await msgRetryCache.set(key, newValue)
-	}
-
 	const sendMessagesAgain = async (
 		key: WAMessageKey,
 		ids: string[],
@@ -1440,8 +1432,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		for (const [i, msg] of msgs.entries()) {
 			if (!ids[i]) continue
 
-			if (msg && (await willSendMessageAgain(ids[i], participant))) {
-				await updateSendMessageAgainCount(ids[i], participant)
+			if (msg && (await reserveRetry(ids[i], participant)) !== undefined) {
 				const msgRelayOpts: MessageRelayOptions = { messageId: ids[i] }
 
 				if (sendToAll) {
@@ -1526,7 +1517,6 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 						if (ids[0] && key.participant && (await willSendMessageAgain(ids[0], key.participant))) {
 							if (key.fromMe) {
 								try {
-									await updateSendMessageAgainCount(ids[0], key.participant)
 									logger.debug({ attrs, key }, 'recv retry request')
 									await sendMessagesAgain(key, ids, retryNode!, node)
 								} catch (error: unknown) {

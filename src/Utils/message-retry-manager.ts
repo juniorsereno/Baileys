@@ -77,10 +77,12 @@ export class MessageRetryManager {
 	})
 	private messageKeyIndex = new Map<string, string>()
 	private sessionRecreateHistory = new LRUCache<string, number>({
+		max: 10_000,
 		ttl: RECREATE_SESSION_TIMEOUT * 2,
 		ttlAutopurge: true
 	})
 	private retryCounters = new LRUCache<string, number>({
+		max: 10_000,
 		ttl: 15 * 60 * 1000,
 		ttlAutopurge: true,
 		updateAgeOnGet: true
