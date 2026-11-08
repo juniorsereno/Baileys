@@ -40,6 +40,7 @@ describe('Identity Change Handling', () => {
 			meLid: mockMeLid,
 			validateSession: mockValidateSession,
 			assertSessions: mockAssertSessions,
+			inFlightRefreshes: new Set<string>(),
 			debounceCache: identityAssertDebounce,
 			logger
 		}

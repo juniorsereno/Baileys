@@ -3,7 +3,6 @@ import { Boom } from '@hapi/boom'
 import { AsyncLocalStorage } from 'async_hooks'
 import { Mutex } from 'async-mutex'
 import { randomBytes } from 'crypto'
-import PQueue from 'p-queue'
 import { DEFAULT_CACHE_TTLS } from '../Defaults'
 import type {
 	AuthenticationCreds,
@@ -11,21 +10,22 @@ import type {
 	SignalDataSet,
 	SignalDataTypeMap,
 	SignalKeyStore,
-	SignalKeyStoreWithTransaction,
+	SignalKeyStoreWithRecordTransaction,
 	TransactionCapabilityOptions
 } from '../Types'
 import { Curve, signedKeyPair } from './crypto'
 import { delay, generateRegistrationId } from './generics'
+import { type LockManager, type LockRef, lockRefKey, makeLockManager } from './lock-manager'
 import type { ILogger } from './logger'
 import { PreKeyManager } from './pre-key-manager'
 
-/**
- * Transaction context stored in AsyncLocalStorage
- */
 interface TransactionContext {
 	cache: SignalDataSet
 	mutations: SignalDataSet
 	dbQueries: number
+	leases: Map<string, Promise<() => void>>
+	nestedLocks: LockManager
+	sealed: boolean
 }
 
 /**
@@ -106,77 +106,16 @@ export function makeCacheableSignalKeyStore(
 	}
 }
 
-/**
- * Adds DB-like transaction capability to the SignalKeyStore
- * Uses AsyncLocalStorage for automatic context management
- * @param state the key store to apply this capability to
- * @param logger logger to log events
- * @returns SignalKeyStore with transaction capability
- */
+/** Record locks cover validation, nested work and the outer durable commit. */
 export const addTransactionCapability = (
 	state: SignalKeyStore,
 	logger: ILogger,
 	{ maxCommitRetries, delayBetweenTriesMs }: TransactionCapabilityOptions
-): SignalKeyStoreWithTransaction => {
+): SignalKeyStoreWithRecordTransaction => {
 	const txStorage = new AsyncLocalStorage<TransactionContext>()
-
-	// Queues for concurrency control (keyed by signal data type - bounded set)
-	const keyQueues = new Map<string, PQueue>()
-
-	// Transaction mutexes with reference counting for cleanup
-	const txMutexes = new Map<string, Mutex>()
-	const txMutexRefCounts = new Map<string, number>()
-
-	// Pre-key manager for specialized operations
+	const scopeStorage = new AsyncLocalStorage<{ held: ReadonlySet<string>; owner?: object }>()
+	const locks = makeLockManager()
 	const preKeyManager = new PreKeyManager(state, logger)
-
-	/**
-	 * Get or create a queue for a specific key type
-	 */
-	function getQueue(key: string): PQueue {
-		if (!keyQueues.has(key)) {
-			keyQueues.set(key, new PQueue({ concurrency: 1 }))
-		}
-
-		return keyQueues.get(key)!
-	}
-
-	/**
-	 * Get or create a transaction mutex
-	 */
-	function getTxMutex(key: string): Mutex {
-		if (!txMutexes.has(key)) {
-			txMutexes.set(key, new Mutex())
-			txMutexRefCounts.set(key, 0)
-		}
-
-		return txMutexes.get(key)!
-	}
-
-	/**
-	 * Acquire a reference to a transaction mutex
-	 */
-	function acquireTxMutexRef(key: string): void {
-		const count = txMutexRefCounts.get(key) ?? 0
-		txMutexRefCounts.set(key, count + 1)
-	}
-
-	/**
-	 * Release a reference to a transaction mutex and cleanup if no longer needed
-	 */
-	function releaseTxMutexRef(key: string): void {
-		const count = (txMutexRefCounts.get(key) ?? 1) - 1
-		txMutexRefCounts.set(key, count)
-
-		// Cleanup if no more references and mutex is not locked
-		if (count <= 0) {
-			const mutex = txMutexes.get(key)
-			if (mutex && !mutex.isLocked()) {
-				txMutexes.delete(key)
-				txMutexRefCounts.delete(key)
-			}
-		}
-	}
 
 	/**
 	 * Check if currently in a transaction
@@ -214,6 +153,75 @@ export const addTransactionCapability = (
 		}
 	}
 
+	async function retainLocks(ctx: TransactionContext, refs: readonly LockRef[]) {
+		if (ctx.sealed) throw new Error('Transaction is already complete')
+		const unique = new Map(refs.map(ref => [lockRefKey(ref), ref]))
+		for (const [key, ref] of [...unique].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+			let lease = ctx.leases.get(key)
+			if (!lease) {
+				lease = locks.acquire(ref, ctx).then(release => {
+					if (ctx.sealed) {
+						release()
+						throw new Error('Transaction completed while acquiring a lock')
+					}
+
+					return release
+				})
+				ctx.leases.set(key, lease)
+			}
+
+			await lease
+		}
+	}
+
+	async function runTransaction<T>(refs: readonly LockRef[], work: () => Promise<T>): Promise<T> {
+		const existing = txStorage.getStore()
+		if (existing) {
+			await retainLocks(existing, refs)
+			const scope = scopeStorage.getStore()
+			const held = scope?.held ?? new Set<string>()
+			const owner = scope?.owner ?? {}
+			const additional = refs.filter(ref => !held.has(lockRefKey(ref)))
+			return existing.nestedLocks.withLocks(
+				additional,
+				() => scopeStorage.run({ held: new Set([...held, ...additional.map(lockRefKey)]), owner }, work),
+				owner
+			)
+		}
+
+		const ctx: TransactionContext = {
+			cache: {},
+			mutations: {},
+			dbQueries: 0,
+			leases: new Map(),
+			nestedLocks: makeLockManager(),
+			sealed: false
+		}
+		try {
+			await retainLocks(ctx, refs)
+			const result = await txStorage.run(ctx, () => scopeStorage.run({ held: new Set(refs.map(lockRefKey)) }, work))
+			ctx.sealed = true
+			await commitWithRetry(ctx.mutations)
+			return result
+		} catch (err) {
+			logger.error({ err }, 'transaction failed, rolling back')
+			throw err
+		} finally {
+			ctx.sealed = true
+			// Release fulfilled leases immediately, including when sibling work is still unwinding.
+			await Promise.all(
+				[...ctx.leases.values()].map(async lease => {
+					try {
+						const release = await lease
+						release()
+					} catch {
+						/* Failed acquisitions own no lock. */
+					}
+				})
+			)
+		}
+	}
+
 	return {
 		get: async (type, ids) => {
 			const ctx = txStorage.getStore()
@@ -223,6 +231,11 @@ export const addTransactionCapability = (
 				return state.get(type, ids)
 			}
 
+			await retainLocks(
+				ctx,
+				ids.map(id => ({ namespace: type, id }))
+			)
+
 			// In transaction - check cache first
 			const cached = ctx.cache[type] || {}
 			const missing = ids.filter(id => !(id in cached))
@@ -231,7 +244,8 @@ export const addTransactionCapability = (
 				ctx.dbQueries++
 				logger.trace({ type, count: missing.length }, 'fetching missing keys in transaction')
 
-				const fetched = await getTxMutex(type).runExclusive(() => state.get(type, missing))
+				// Record locks stay held until this snapshot has been committed.
+				const fetched = await state.get(type, missing)
 
 				// Update cache
 				ctx.cache[type] = ctx.cache[type] || ({} as any)
@@ -254,28 +268,41 @@ export const addTransactionCapability = (
 			const ctx = txStorage.getStore()
 
 			if (!ctx) {
-				// No transaction - direct write with queue protection
-				const types = Object.keys(data)
-
-				// Process pre-keys with validation
-				for (const type_ of types) {
-					const type = type_ as keyof SignalDataTypeMap
-					if (type === 'pre-key') {
-						await preKeyManager.validateDeletions(data, type)
+				// Validate and persist all affected records under the same locks as transactions.
+				const types = Object.keys(data) as Array<keyof SignalDataTypeMap>
+				const lockRefs = types.flatMap(type => Object.keys(data[type] ?? {}).map(id => ({ namespace: type, id })))
+				await locks.withLocks(lockRefs, async () => {
+					if ('pre-key' in data) {
+						await preKeyManager.validateDeletions(data, 'pre-key')
 					}
-				}
 
-				// Write all data in parallel
-				await Promise.all(
-					types.map(type =>
-						getQueue(type).add(async () => {
-							const typeData = { [type]: data[type as keyof SignalDataTypeMap] } as SignalDataSet
-							await state.set(typeData)
-						})
-					)
-				)
+					// `validateDeletions` may have emptied the pre-key bucket
+					// (every targeted id was already gone). Skip `state.set` if
+					// every bucket is empty — no work to do, and writing
+					// `{ 'pre-key': {} }` is a wasteful no-op against the
+					// storage adapter. Preserved from Stage 1's review fix.
+					let hasAny = false
+					for (const t of types) {
+						const bucket = data[t]
+						if (bucket && Object.keys(bucket).length > 0) {
+							hasAny = true
+							break
+						}
+					}
+
+					if (hasAny) {
+						await state.set(data)
+					}
+				})
 				return
 			}
+
+			await retainLocks(
+				ctx,
+				(Object.keys(data) as Array<keyof SignalDataTypeMap>).flatMap(type =>
+					Object.keys(data[type] ?? {}).map(id => ({ namespace: type, id }))
+				)
+			)
 
 			// In transaction - update cache and mutations
 			logger.trace({ types: Object.keys(data) }, 'caching in transaction')
@@ -300,47 +327,12 @@ export const addTransactionCapability = (
 
 		isInTransaction,
 
-		transaction: async (work, key) => {
-			const existing = txStorage.getStore()
-
-			// Nested transaction - reuse existing context
-			if (existing) {
-				logger.trace('reusing existing transaction context')
-				return work()
-			}
-
-			// New transaction - acquire mutex and create context
-			const mutex = getTxMutex(key)
-			acquireTxMutexRef(key)
-
-			try {
-				return await mutex.runExclusive(async () => {
-					const ctx: TransactionContext = {
-						cache: {},
-						mutations: {},
-						dbQueries: 0
-					}
-
-					logger.trace('entering transaction')
-
-					try {
-						const result = await txStorage.run(ctx, work)
-
-						// Commit mutations
-						await commitWithRetry(ctx.mutations)
-
-						logger.trace({ dbQueries: ctx.dbQueries }, 'transaction completed')
-
-						return result
-					} catch (error) {
-						logger.error({ error }, 'transaction failed, rolling back')
-						throw error
-					}
-				})
-			} finally {
-				releaseTxMutexRef(key)
-			}
-		}
+		transaction: (work, key) => runTransaction([{ namespace: '__legacy__', id: key }], work),
+		transactWith: (scope, work) =>
+			runTransaction(
+				scope.records.map(r => ({ namespace: r.type, id: r.id })),
+				work
+			)
 	}
 }
 
