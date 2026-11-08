@@ -2,7 +2,6 @@
 import * as libsignal from 'libsignal'
 // @ts-ignore
 import { PreKeyWhisperMessage } from 'libsignal/src/protobufs'
-import { LRUCache } from 'lru-cache'
 import type {
 	LIDMapping,
 	RecordRef,
@@ -116,11 +115,6 @@ export function makeLibSignalRepository(
 	// implemented; narrow to the record-transaction variant so the internal
 	// call sites don't have to null-check the (publicly optional) method.
 	const parsedKeys = auth.keys as SignalKeyStoreWithRecordTransaction
-	const migratedSessionCache = new LRUCache<string, true>({
-		ttl: 3 * 24 * 60 * 60 * 1000, // 7 days
-		ttlAutopurge: true,
-		updateAgeOnGet: true
-	})
 
 	const ensureSenderKeyAndCreateSkdm = async (group: string, meId: string) => {
 		const senderName = jidToSignalSenderKeyName(group, meId)
@@ -358,7 +352,6 @@ export function makeLibSignalRepository(
 		},
 
 		close() {
-			migratedSessionCache.clear()
 			lidMapping.close()
 		},
 
@@ -390,14 +383,8 @@ export function makeLibSignalRepository(
 				userDevices.push(fromDeviceStr)
 			}
 
-			// Filter out cached devices before database fetch
-			const uncachedDevices = userDevices.filter(device => {
-				const deviceKey = `${user}.${device}`
-				return !migratedSessionCache.has(deviceKey)
-			})
-
-			// Bulk check session existence only for uncached devices
-			const deviceSessionKeys = uncachedDevices.map(device => `${user}.${device}`)
+			// Persisted PN sessions are authoritative: a failed migration must remain retryable.
+			const deviceSessionKeys = userDevices.map(device => `${user}.${device}`)
 			const existingSessions = await parsedKeys.get('session', deviceSessionKeys)
 
 			// Step 3: Convert existing sessions to JIDs (only migrate sessions that exist)
@@ -431,31 +418,10 @@ export function makeLibSignalRepository(
 			// we can build a precise lock scope before entering the critical
 			// section (H4 fix: lock the actual session record ids + the
 			// device-list record, instead of a synthetic `migrate-N-...` key).
-			type MigrationOp = {
-				fromJid: string
-				toJid: string
-				pnUser: string
-				lidUser: string
-				deviceId: number
-				fromAddr: libsignal.ProtocolAddress
-				toAddr: libsignal.ProtocolAddress
-			}
-
-			const migrationOps: MigrationOp[] = deviceJids.map(jid => {
-				const lidWithDevice = transferDevice(jid, toJid)
-				const fromDecoded = jidDecode(jid)!
-				const toDecoded = jidDecode(lidWithDevice)!
-
-				return {
-					fromJid: jid,
-					toJid: lidWithDevice,
-					pnUser: fromDecoded.user,
-					lidUser: toDecoded.user,
-					deviceId: fromDecoded.device || 0,
-					fromAddr: jidToSignalProtocolAddress(jid),
-					toAddr: jidToSignalProtocolAddress(lidWithDevice)
-				}
-			})
+			const migrationOps = deviceJids.map(jid => ({
+				fromAddr: jidToSignalProtocolAddress(jid),
+				toAddr: jidToSignalProtocolAddress(transferDevice(jid, toJid))
+			}))
 
 			const sessionRecords: RecordRef[] = []
 			for (const op of migrationOps) {
@@ -500,14 +466,6 @@ export function makeLibSignalRepository(
 					if (Object.keys(sessionUpdates).length > 0) {
 						await parsedKeys.set({ session: sessionUpdates })
 						logger.debug({ migratedSessions: migratedCount }, 'bulk session migration complete')
-
-						// Cache device-level migrations
-						for (const op of migrationOps) {
-							if (sessionUpdates[op.toAddr.toString()]) {
-								const deviceKey = `${op.pnUser}.${op.deviceId}`
-								migratedSessionCache.set(deviceKey, true)
-							}
-						}
 					}
 
 					const skippedCount = totalOps - migratedCount

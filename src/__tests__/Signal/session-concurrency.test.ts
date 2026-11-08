@@ -28,6 +28,7 @@ async function peer(jid: string) {
 	await keys.set({ 'pre-key': { '1': preKey } })
 	return {
 		jid,
+		store: state.keys,
 		keys,
 		repo,
 		bundle: {
@@ -122,4 +123,20 @@ it('migrates the committed PN session after an in-flight send and continues decr
 	expect(await bob.repo.decryptMessage({ jid: alice.jid, ...encrypted })).toEqual(Buffer.from('before migration'))
 	const after = await alice.repo.encryptMessage({ jid: lid, data: Buffer.from('after migration') })
 	expect(await bob.repo.decryptMessage({ jid: alice.jid, ...after })).toEqual(Buffer.from('after migration'))
+})
+
+it('can retry PN/LID migration after its durable session write fails', async () => {
+	const alice = await peer('12025550101@s.whatsapp.net')
+	const bob = await peer('12025550102@s.whatsapp.net')
+	const lid = '100000000002@lid'
+	await alice.repo.injectE2ESession({ jid: bob.jid, session: bob.bundle })
+	await alice.keys.set({ 'device-list': { '12025550102': ['0'] } })
+	jest.spyOn(alice.store, 'set').mockImplementationOnce(async () => {
+		throw new Error('fixture migration write failed')
+	})
+	await expect(alice.repo.migrateSession(bob.jid, lid)).rejects.toThrow('fixture migration write failed')
+	expect(await alice.repo.migrateSession(bob.jid, lid)).toMatchObject({ migrated: 1 })
+	await alice.repo.lidMapping.storeLIDPNMappings([{ pn: bob.jid, lid }])
+	const encrypted = await alice.repo.encryptMessage({ jid: lid, data: Buffer.from('migration retried') })
+	expect(await bob.repo.decryptMessage({ jid: alice.jid, ...encrypted })).toEqual(Buffer.from('migration retried'))
 })
