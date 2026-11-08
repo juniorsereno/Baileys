@@ -32,6 +32,7 @@ import {
 	configureSuccessfulPairing,
 	Curve,
 	DEF_MEDIA_HOST,
+	delay,
 	derivePairingCodeKey,
 	generateLoginNode,
 	generateMdTagPrefix,
@@ -538,48 +539,67 @@ export const makeSocket = (config: SocketConfig) => {
 			return
 		}
 
-		const uploadLogic = async (retryCount: number): Promise<void> => {
-			logger.info({ count, retryCount }, 'uploading pre-keys')
+		let expired = false
+		const deadline = Date.now() + UPLOAD_TIMEOUT
+		const assertUploadActive = () => {
+			if (expired || Date.now() >= deadline) {
+				throw new Boom('Pre-key upload timeout', { statusCode: DisconnectReason.timedOut })
+			}
 
-			// Generate and save pre-keys atomically (prevents ID collisions on retry)
-			const node = await keys.transaction(async () => {
-				logger.debug({ requestedCount: count }, 'generating pre-keys with requested count')
-				const { update, node } = await getNextPreKeysNode({ creds, keys }, count)
-				// Update credentials immediately to prevent duplicate IDs on retry
-				ev.emit('creds.update', update)
-				return node
-			}, creds?.me?.id || 'upload-pre-keys')
-
-			// Upload to server (outside transaction, can fail without affecting local keys)
-			try {
-				await query(node)
-				logger.info({ count }, 'uploaded pre-keys successfully')
-			} catch (uploadError) {
-				logger.error({ uploadError: (uploadError as Error).toString(), count }, 'Failed to upload pre-keys to server')
-
-				// Recurse into uploadLogic; calling uploadPreKeys would await its own in-flight promise.
-				if (retryCount < 3) {
-					const backoffDelay = Math.min(1000 * Math.pow(2, retryCount), 10000)
-					logger.info(`Retrying pre-key upload in ${backoffDelay}ms`)
-					await new Promise(resolve => setTimeout(resolve, backoffDelay))
-					return uploadLogic(retryCount + 1)
-				}
-
-				throw uploadError
+			if (!ws.isOpen) {
+				throw new Boom('Connection Closed', { statusCode: DisconnectReason.connectionClosed })
 			}
 		}
 
-		// Add timeout protection
-		uploadPreKeysPromise = Promise.race([
-			uploadLogic(0),
-			new Promise<void>((_, reject) =>
-				setTimeout(() => reject(new Boom('Pre-key upload timeout', { statusCode: 408 })), UPLOAD_TIMEOUT)
+		const uploadLogic = async (): Promise<void> => {
+			assertUploadActive()
+			const { update, node } = await keys.transaction(
+				() => getNextPreKeysNode({ creds, keys }, count),
+				creds.me?.id || 'upload-pre-keys'
 			)
+			assertUploadActive()
+			// Publish allocation only after storage commits; upload progress requires a server acknowledgement.
+			ev.emit('creds.update', { nextPreKeyId: update.nextPreKeyId })
+
+			for (let retryCount = 0; ; retryCount++) {
+				assertUploadActive()
+				logger.info({ count, retryCount }, 'uploading pre-keys')
+				try {
+					const response = await query(node, Math.min(defaultQueryTimeoutMs || UPLOAD_TIMEOUT, deadline - Date.now()))
+					assertUploadActive()
+					if (!response || response.tag !== 'iq' || response.attrs.type !== 'result') {
+						throw new Boom('Pre-key upload was not acknowledged', { statusCode: DisconnectReason.timedOut })
+					}
+
+					ev.emit('creds.update', {
+						firstUnuploadedPreKeyId: Math.max(creds.firstUnuploadedPreKeyId, update.firstUnuploadedPreKeyId!)
+					})
+					logger.info({ count }, 'uploaded pre-keys successfully')
+					return
+				} catch (err) {
+					logger.error({ err, count }, 'Failed to upload pre-keys to server')
+					assertUploadActive()
+					if (retryCount >= 3) throw err
+					await delay(Math.min(1000 * Math.pow(2, retryCount), 10000))
+				}
+			}
+		}
+
+		let timeout: ReturnType<typeof setTimeout> | undefined
+		uploadPreKeysPromise = Promise.race([
+			uploadLogic(),
+			new Promise<void>((_, reject) => {
+				timeout = setTimeout(() => {
+					expired = true
+					reject(new Boom('Pre-key upload timeout', { statusCode: DisconnectReason.timedOut }))
+				}, UPLOAD_TIMEOUT)
+			})
 		])
 
 		try {
 			await uploadPreKeysPromise
 		} finally {
+			clearTimeout(timeout)
 			uploadPreKeysPromise = null
 		}
 	}
