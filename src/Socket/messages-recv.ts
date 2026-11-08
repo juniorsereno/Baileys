@@ -53,6 +53,7 @@ import {
 	xmppPreKey,
 	xmppSignedPreKey
 } from '../Utils'
+import { makeLidSessionMigrator } from '../Utils/lid-session-migrator'
 import { makeKeyedMutex, makeMutex } from '../Utils/make-mutex'
 import { makeOfflineNodeProcessor, type MessageType } from '../Utils/offline-node-processor'
 import { buildAckStanza } from '../Utils/stanza-ack'
@@ -144,6 +145,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	/** this mutex ensures that each retryRequest will wait for the previous one to finish */
 	const retryMutex = makeMutex()
 
+	const migrateLidSession = makeLidSessionMigrator(signalRepository)
+
 	const msgRetryCache =
 		config.msgRetryCounterCache ||
 		new NodeCache<number>({
@@ -179,6 +182,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 	// Debounce identity-change session refreshes per JID to avoid bursts
 	const identityAssertDebounce = new NodeCache<boolean>({ stdTTL: 5, useClones: false })
+	/** In-flight identity refreshes — see handleIdentityChange M11 guard. */
+	const inFlightIdentityRefreshes = new Set<string>()
 
 	let sendActiveReceipts = false
 
@@ -786,6 +791,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				validateSession: signalRepository.validateSession,
 				assertSessions,
 				debounceCache: identityAssertDebounce,
+				inFlightRefreshes: inFlightIdentityRefreshes,
 				logger,
 				onBeforeSessionRefresh: reissueTcTokenAfterIdentityChange
 			})
@@ -1596,15 +1602,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			if (!!alt) {
 				const altServer = jidDecode(alt)?.server
 				const primaryJid = msg.key.participant || msg.key.remoteJid!
-				if (altServer === 'lid') {
-					if (!(await signalRepository.lidMapping.getPNForLID(alt))) {
-						await signalRepository.lidMapping.storeLIDPNMappings([{ lid: alt, pn: primaryJid }])
-						await signalRepository.migrateSession(primaryJid, alt)
-					}
-				} else {
-					await signalRepository.lidMapping.storeLIDPNMappings([{ lid: primaryJid, pn: alt }])
-					await signalRepository.migrateSession(alt, primaryJid)
-				}
+				await (altServer === 'lid' ? migrateLidSession(primaryJid, alt) : migrateLidSession(alt, primaryJid))
 			}
 
 			await messageMutex.mutex(async () => {
