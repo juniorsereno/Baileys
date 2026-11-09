@@ -227,7 +227,7 @@ export const encodeSyncdPatch = async (
 
 class AppStateRecordDecodeError extends Error {
 	constructor() {
-		super('Malformed app-state record failed authentication')
+		super('Cannot authenticate undecodable app-state record')
 		this.name = 'AppStateRecordDecodeError'
 	}
 }
@@ -283,18 +283,24 @@ export const decodeSyncdMutations = async (
 			continue
 		}
 
-		let syncAction: proto.SyncActionData | undefined
-		let index: ChatMutation['index']
+		let syncAction: proto.SyncActionData
 		try {
 			syncAction = proto.SyncActionData.decode(result)
+		} catch {
+			// Without a decoded index its MAC cannot be verified. Request a snapshot
+			// rather than commit an arbitrary index under an otherwise valid content MAC.
+			throw new AppStateRecordDecodeError()
+		}
+
+		let index: ChatMutation['index']
+		try {
 			index = JSON.parse(Buffer.from(syncAction.index!).toString())
 		} catch {
-			// An authenticated opaque record still contributes to the server's LTHash.
-			// Do not let malformed protobuf/JSON discard other actions or advance with a partial hash.
 			const mac = generateMac(operation!, encContent, record.keyId!.id!, key.valueMacKey)
 			if (
+				!syncAction.index ||
 				Buffer.compare(mac, ogValueMac) !== 0 ||
-				(syncAction?.index && Buffer.compare(hmacSign(syncAction.index, key.indexKey), record.index!.blob!) !== 0)
+				Buffer.compare(hmacSign(syncAction.index, key.indexKey), record.index!.blob!) !== 0
 			) {
 				throw new AppStateRecordDecodeError()
 			}
@@ -302,7 +308,7 @@ export const decodeSyncdMutations = async (
 			ltGenerator.mix({ indexMac: record.index!.blob!, valueMac: ogValueMac, operation: operation! })
 			logger?.warn(
 				{ event: 'app-state.record.undecodable', bytes: result.length },
-				'Authenticated app-state record could not be decoded; preserving hash without applying action'
+				'Authenticated app-state record has an invalid JSON index; preserving hash without applying action'
 			)
 			continue
 		}

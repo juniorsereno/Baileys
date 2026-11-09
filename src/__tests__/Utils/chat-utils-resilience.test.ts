@@ -189,15 +189,46 @@ const malformedRecord = (payload: Uint8Array = Buffer.from([63]), index?: Uint8A
 	return { bad, mac }
 }
 
-it('continues valid app-state actions around an authenticated record with malformed protobuf and preserves its LTHash contribution', async () => {
+it.each([true, false])(
+	'rejects both arbitrary indexes of an opaque record without modifying state (validateMacs=%s)',
+	async validateMacs => {
+		const initial = newLTHashState()
+		const { bad } = malformedRecord()
+		const onMutation = jest.fn()
+		for (const blob of [randomBytes(32), randomBytes(32)]) {
+			await expect(
+				decodeSyncdMutations([{ ...bad, index: { blob } }], initial, getAppStateSyncKey, onMutation, validateMacs)
+			).rejects.toMatchObject({ name: 'AppStateRecordDecodeError' })
+		}
+
+		expect(onMutation).not.toHaveBeenCalled()
+		expect(initial.hash).toEqual(Buffer.alloc(128))
+		expect(initial.indexValueMap).toEqual({})
+	}
+)
+
+it('preserves the last version after an opaque patch and can recover from a valid snapshot', async () => {
 	const initial = newLTHashState()
-	const { record: first } = await encodeValidRecord(initial)
-	const { record: last } = await encodeValidRecord(initial)
-	const { bad, mac } = malformedRecord()
-	const { seen, onMutation } = collector()
-	const result = await decodeSyncdMutations([first, bad, last], initial, getAppStateSyncKey, onMutation, true)
-	expect(seen).toHaveLength(2)
-	expect(result.indexValueMap[Buffer.from(bad.index!.blob!).toString('base64')]?.valueMac).toEqual(mac)
+	const { bad } = malformedRecord()
+	const patch: proto.ISyncdPatch = {
+		version: { version: 1 },
+		mutations: [{ operation: proto.SyncdMutation.SyncdOperation.SET, record: bad }]
+	}
+	await expect(
+		decodePatches(NAME, [patch], initial, getAppStateSyncKey, {}, undefined, undefined, false)
+	).rejects.toMatchObject({ name: 'AppStateRecordDecodeError' })
+	expect(initial.version).toBe(0)
+	expect(initial.indexValueMap).toEqual({})
+	const { record, patch: validPatch, newState } = await encodeValidRecord(initial)
+	const recovered = await decodeSyncdSnapshot(
+		NAME,
+		{ version: { version: newState.version }, records: [record], keyId: record.keyId, mac: validPatch.snapshotMac },
+		getAppStateSyncKey,
+		undefined,
+		true
+	)
+	expect(recovered.state.version).toBe(1)
+	expect(Object.keys(recovered.mutationMap)).toHaveLength(1)
 })
 
 it('rejects an unauthenticated malformed record even when general MAC checks are disabled', async () => {
