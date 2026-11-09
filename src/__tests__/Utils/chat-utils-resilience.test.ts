@@ -1,8 +1,16 @@
 import { jest } from '@jest/globals'
 import { randomBytes } from 'crypto'
+import { expandAppStateKeys } from 'whatsapp-rust-bridge'
 import { proto } from '../../../WAProto/index.js'
 import type { LTHashState, WAPatchName } from '../../Types'
-import { decodeSyncdMutations, decodeSyncdSnapshot, encodeSyncdPatch, newLTHashState } from '../../Utils/chat-utils'
+import {
+	decodePatches,
+	decodeSyncdMutations,
+	decodeSyncdSnapshot,
+	encodeSyncdPatch,
+	newLTHashState
+} from '../../Utils/chat-utils'
+import { aesEncrypt, hmacSign } from '../../Utils/crypto'
 
 /**
  * Resilience tests for app-state-sync decode paths.
@@ -163,4 +171,83 @@ describe('decodeSyncdSnapshot resilience', () => {
 		// The valid record should still have been processed into the mutation map.
 		expect(Object.keys(mutationMap).length).toBe(1)
 	})
+})
+
+const malformedRecord = (payload: Uint8Array = Buffer.from([63]), index?: Uint8Array) => {
+	const keyId = Buffer.from(MY_KEY_ID, 'base64')
+	const keys = expandAppStateKeys(APP_STATE_KEY.keyData!)
+	const encrypted = aesEncrypt(payload, keys.valueEncryptionKey)
+	const prefix = Buffer.concat([Buffer.from([1]), keyId])
+	const length = Buffer.alloc(8)
+	length[7] = prefix.length
+	const mac = hmacSign(Buffer.concat([prefix, encrypted, length]), keys.valueMacKey, 'sha512').subarray(0, 32)
+	const bad: proto.ISyncdRecord = {
+		keyId: { id: keyId },
+		index: { blob: index ? hmacSign(index, keys.indexKey) : randomBytes(32) },
+		value: { blob: Buffer.concat([encrypted, mac]) }
+	}
+	return { bad, mac }
+}
+
+it('continues valid app-state actions around an authenticated record with malformed protobuf and preserves its LTHash contribution', async () => {
+	const initial = newLTHashState()
+	const { record: first } = await encodeValidRecord(initial)
+	const { record: last } = await encodeValidRecord(initial)
+	const { bad, mac } = malformedRecord()
+	const { seen, onMutation } = collector()
+	const result = await decodeSyncdMutations([first, bad, last], initial, getAppStateSyncKey, onMutation, true)
+	expect(seen).toHaveLength(2)
+	expect(result.indexValueMap[Buffer.from(bad.index!.blob!).toString('base64')]?.valueMac).toEqual(mac)
+})
+
+it('rejects an unauthenticated malformed record even when general MAC checks are disabled', async () => {
+	const { bad } = malformedRecord()
+	const blob = Buffer.from(bad.value!.blob!)
+	blob[blob.length - 1] = blob[blob.length - 1]! ^ 1
+	bad.value = { blob }
+	await expect(
+		decodeSyncdMutations([bad], newLTHashState(), getAppStateSyncKey, () => {}, false)
+	).rejects.toMatchObject({ name: 'AppStateRecordDecodeError' })
+})
+
+it('does not advance a patch version when a malformed record fails authentication', async () => {
+	const { bad } = malformedRecord()
+	const blob = Buffer.from(bad.value!.blob!)
+	blob[blob.length - 1] = blob[blob.length - 1]! ^ 1
+	bad.value = { blob }
+	const initial = newLTHashState()
+	const patch: proto.ISyncdPatch = {
+		version: { version: 1 },
+		mutations: [{ operation: proto.SyncdMutation.SyncdOperation.SET, record: bad }]
+	}
+	await expect(
+		decodePatches(NAME, [patch], initial, getAppStateSyncKey, {}, undefined, undefined, false)
+	).rejects.toMatchObject({ name: 'AppStateRecordDecodeError' })
+	expect(initial.version).toBe(0)
+	expect(Object.keys(initial.indexValueMap)).toHaveLength(0)
+})
+
+it('keeps the hash contribution of an authenticated action with an invalid JSON index', async () => {
+	const index = Buffer.from('[')
+	const payload = proto.SyncActionData.encode({ index, value: { archiveChatAction: { archived: true } } }).finish()
+	const { bad, mac } = malformedRecord(payload, index)
+	const onMutation = jest.fn()
+	const result = await decodeSyncdMutations([bad], newLTHashState(), getAppStateSyncKey, onMutation, true)
+	expect(onMutation).not.toHaveBeenCalled()
+	expect(result.indexValueMap[Buffer.from(bad.index!.blob!).toString('base64')]?.valueMac).toEqual(mac)
+})
+
+it('does not hide failures in the application mutation callback', async () => {
+	const { record } = await encodeValidRecord(newLTHashState())
+	await expect(
+		decodeSyncdMutations(
+			[record],
+			newLTHashState(),
+			getAppStateSyncKey,
+			() => {
+				throw new Error('fixture application failure')
+			},
+			true
+		)
+	).rejects.toThrow('fixture application failure')
 })

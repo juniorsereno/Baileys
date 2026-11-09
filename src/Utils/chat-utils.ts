@@ -225,12 +225,20 @@ export const encodeSyncdPatch = async (
 	return { patch, state }
 }
 
+class AppStateRecordDecodeError extends Error {
+	constructor() {
+		super('Malformed app-state record failed authentication')
+		this.name = 'AppStateRecordDecodeError'
+	}
+}
+
 export const decodeSyncdMutations = async (
 	msgMutations: (proto.ISyncdMutation | proto.ISyncdRecord)[],
 	initialState: LTHashState,
 	getAppStateSyncKey: FetchAppStateSyncKey,
 	onMutation: (mutation: ChatMutation) => void,
-	validateMacs: boolean
+	validateMacs: boolean,
+	logger?: ILogger
 ) => {
 	const ltGenerator = makeLtHashGenerator(initialState)
 	const derivedKeyCache = new Map<string, ReturnType<typeof mutationKeys>>()
@@ -275,7 +283,29 @@ export const decodeSyncdMutations = async (
 			continue
 		}
 
-		const syncAction = proto.SyncActionData.decode(result)
+		let syncAction: proto.SyncActionData | undefined
+		let index: ChatMutation['index']
+		try {
+			syncAction = proto.SyncActionData.decode(result)
+			index = JSON.parse(Buffer.from(syncAction.index!).toString())
+		} catch {
+			// An authenticated opaque record still contributes to the server's LTHash.
+			// Do not let malformed protobuf/JSON discard other actions or advance with a partial hash.
+			const mac = generateMac(operation!, encContent, record.keyId!.id!, key.valueMacKey)
+			if (
+				Buffer.compare(mac, ogValueMac) !== 0 ||
+				(syncAction?.index && Buffer.compare(hmacSign(syncAction.index, key.indexKey), record.index!.blob!) !== 0)
+			) {
+				throw new AppStateRecordDecodeError()
+			}
+
+			ltGenerator.mix({ indexMac: record.index!.blob!, valueMac: ogValueMac, operation: operation! })
+			logger?.warn(
+				{ event: 'app-state.record.undecodable', bytes: result.length },
+				'Authenticated app-state record could not be decoded; preserving hash without applying action'
+			)
+			continue
+		}
 
 		if (validateMacs) {
 			const hmac = hmacSign(syncAction.index!, key.indexKey)
@@ -284,8 +314,7 @@ export const decodeSyncdMutations = async (
 			}
 		}
 
-		const indexStr = Buffer.from(syncAction.index!).toString()
-		onMutation({ syncAction, index: JSON.parse(indexStr) })
+		onMutation({ syncAction, index })
 
 		ltGenerator.mix({
 			indexMac: record.index!.blob!,
@@ -323,7 +352,8 @@ export const decodeSyncdPatch = async (
 	initialState: LTHashState,
 	getAppStateSyncKey: FetchAppStateSyncKey,
 	onMutation: (mutation: ChatMutation) => void,
-	validateMacs: boolean
+	validateMacs: boolean,
+	logger?: ILogger
 ) => {
 	if (validateMacs) {
 		const base64Key = Buffer.from(msg.keyId!.id!).toString('base64')
@@ -347,7 +377,14 @@ export const decodeSyncdPatch = async (
 		}
 	}
 
-	const result = await decodeSyncdMutations(msg.mutations!, initialState, getAppStateSyncKey, onMutation, validateMacs)
+	const result = await decodeSyncdMutations(
+		msg.mutations!,
+		initialState,
+		getAppStateSyncKey,
+		onMutation,
+		validateMacs,
+		logger
+	)
 	return result
 }
 
@@ -447,7 +484,8 @@ export const decodeSyncdSnapshot = async (
 					mutationMap[index!] = mutation
 				}
 			: () => {},
-		validateMacs
+		validateMacs,
+		logger
 	)
 	newState.hash = hash
 	newState.indexValueMap = indexValueMap
@@ -525,10 +563,11 @@ export const decodePatches = async (
 							mutationMap[index!] = mutation
 						}
 					: () => {},
-				validateMacs
+				validateMacs,
+				logger
 			)
 		} catch (err) {
-			if (isMissingKeyError(err)) throw err
+			if (isMissingKeyError(err) || err instanceof AppStateRecordDecodeError) throw err
 			logger?.warn({ name, version: patchVersion, error: (err as Error).message }, 'failed to decode patch, skipping')
 			continue
 		}
