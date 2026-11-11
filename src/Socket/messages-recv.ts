@@ -1936,12 +1936,18 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 	}
 
+	// Top-level status stanzas also require an ACK, even when stories are ignored.
+	const handleStatus = async (node: BinaryNode) => {
+		await sendMessageAck(node)
+	}
+
 	const offlineNodeProcessor = makeOfflineNodeProcessor(
 		new Map<MessageType, (node: BinaryNode) => Promise<void>>([
 			['message', handleMessage],
 			['call', handleCall],
 			['receipt', handleReceipt],
-			['notification', handleNotification]
+			['notification', handleNotification],
+			['status', handleStatus]
 		]),
 		{
 			isWsOpen: () => ws.isOpen,
@@ -1982,6 +1988,12 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			await processNodeWithBuffer(node, identifier, exec)
 		}
 	}
+
+	ws.on('CB:status', (node: BinaryNode) => {
+		processNode('status', node, 'acking status stanza', handleStatus).catch(error =>
+			onUnexpectedError(error, 'acking status stanza')
+		)
+	})
 
 	// recv a message
 	ws.on('CB:message', async (node: BinaryNode) => {
