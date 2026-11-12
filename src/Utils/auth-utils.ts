@@ -111,7 +111,7 @@ export const addTransactionCapability = (
 	state: SignalKeyStore,
 	logger: ILogger,
 	{ maxCommitRetries, delayBetweenTriesMs }: TransactionCapabilityOptions
-): SignalKeyStoreWithRecordTransaction => {
+): SignalKeyStoreWithRecordTransaction & { runOutsideTransaction<T>(work: () => T): T } => {
 	const txStorage = new AsyncLocalStorage<TransactionContext>()
 	const scopeStorage = new AsyncLocalStorage<{ held: ReadonlySet<string>; owner?: object }>()
 	const locks = makeLockManager()
@@ -326,6 +326,7 @@ export const addTransactionCapability = (
 		},
 
 		isInTransaction,
+		runOutsideTransaction: work => txStorage.exit(() => scopeStorage.exit(work)),
 
 		transaction: (work, key) => runTransaction([{ namespace: '__legacy__', id: key }], work),
 		transactWith: (scope, work) =>

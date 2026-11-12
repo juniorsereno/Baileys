@@ -634,6 +634,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			})
 		}
 
+		let issueTcToken: (() => void) | undefined
+
 		await authState.keys.transaction(async () => {
 			const mediaType = getMediaType(message)
 			if (mediaType) {
@@ -1068,39 +1070,44 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				shouldSendNewTcToken(existingTokenEntry?.senderTimestamp) &&
 				!inFlightTcTokenIssuance.has(tcTokenJid)
 			) {
-				inFlightTcTokenIssuance.add(tcTokenJid)
 				const issueTimestamp = unixTimestampSeconds()
 				const getPNForLID = signalRepository.lidMapping.getPNForLID.bind(signalRepository.lidMapping)
-				resolveIssuanceJid(destinationJid, sock.serverProps.lidTrustedTokenIssueToLid, getLIDForPN, getPNForLID)
-					.then(issueJid => issuePrivacyTokens([issueJid], issueTimestamp))
-					.then(async result => {
-						await storeTcTokensFromIqResult({
-							result,
-							fallbackJid: tcTokenJid,
-							keys: authState.keys,
-							getLIDForPN
-						})
+				issueTcToken = () => {
+					if (inFlightTcTokenIssuance.has(tcTokenJid)) return
+					inFlightTcTokenIssuance.add(tcTokenJid)
+					resolveIssuanceJid(destinationJid, sock.serverProps.lidTrustedTokenIssueToLid, getLIDForPN, getPNForLID)
+						.then(issueJid => issuePrivacyTokens([issueJid], issueTimestamp))
+						.then(async result => {
+							await authState.keys.transaction(async () => {
+								await storeTcTokensFromIqResult({
+									result,
+									fallbackJid: tcTokenJid,
+									keys: authState.keys,
+									getLIDForPN
+								})
 
-						const currentData = await authState.keys.get('tctoken', [tcTokenJid])
-						const currentEntry = currentData[tcTokenJid]
-						const indexWrite = await buildMergedTcTokenIndexWrite(authState.keys, [tcTokenJid])
-						await authState.keys.set({
-							tctoken: {
-								[tcTokenJid]: {
-									token: Buffer.alloc(0),
-									...currentEntry,
-									senderTimestamp: issueTimestamp
-								},
-								...indexWrite
-							}
+								const currentData = await authState.keys.get('tctoken', [tcTokenJid])
+								const currentEntry = currentData[tcTokenJid]
+								const indexWrite = await buildMergedTcTokenIndexWrite(authState.keys, [tcTokenJid])
+								await authState.keys.set({
+									tctoken: {
+										[tcTokenJid]: {
+											token: Buffer.alloc(0),
+											...currentEntry,
+											senderTimestamp: issueTimestamp
+										},
+										...indexWrite
+									}
+								})
+							}, 'tctoken-issuance:' + tcTokenJid)
 						})
-					})
-					.catch(err => {
-						logger.debug({ jid: destinationJid, err: err?.message }, 'fire-and-forget tctoken issuance failed')
-					})
-					.finally(() => {
-						inFlightTcTokenIssuance.delete(tcTokenJid)
-					})
+						.catch(err => {
+							logger.debug({ jid: destinationJid, err: err?.message }, 'fire-and-forget tctoken issuance failed')
+						})
+						.finally(() => {
+							inFlightTcTokenIssuance.delete(tcTokenJid)
+						})
+				}
 			}
 
 			// Add message to retry cache if enabled
@@ -1108,6 +1115,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				messageRetryManager.addRecentMessage(destinationJid, msgId, message)
 			}
 		}, meId)
+
+		if (issueTcToken) authState.keys.runOutsideTransaction(issueTcToken)
 
 		return msgId
 	}
