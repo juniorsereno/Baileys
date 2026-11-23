@@ -121,6 +121,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 	// Prevent race conditions in Signal session encryption by user
 	const encryptionMutex = makeKeyedMutex()
+	const directRelayIdentityMutex = makeMutex()
 	const directRelayMutex = makeKeyedMutex()
 
 	/**
@@ -201,18 +202,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		jid: string
 	}
 
-	/** Fetch all the devices we've to send a message to */
-	const getUSyncDevices = async (
-		jids: string[],
-		useCache: boolean,
-		ignoreZeroDevices: boolean
-	): Promise<DeviceWithJid[]> => {
+	const collectKnownDevices = async (jids: string[], useCache: boolean) => {
 		const deviceResults: DeviceWithJid[] = []
-
-		if (!useCache) {
-			logger.debug('not using cache for devices')
-		}
-
 		const toFetch: string[] = []
 
 		const jidsWithUser = jids
@@ -264,9 +255,12 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			}
 		}
 
-		if (!toFetch.length) {
-			return deviceResults
-		}
+		return { deviceResults, toFetch }
+	}
+
+	const fetchUSyncDevices = async (toFetch: string[], ignoreZeroDevices: boolean): Promise<DeviceWithJid[]> => {
+		const deviceResults: DeviceWithJid[] = []
+		if (!toFetch.length) return deviceResults
 
 		const requestedLidUsers = new Set<string>()
 		for (const jid of toFetch) {
@@ -374,6 +368,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		}
 
 		return deviceResults
+	}
+
+	/** Fetch all the devices we've to send a message to */
+	const getUSyncDevices = async (jids: string[], useCache: boolean, ignoreZeroDevices: boolean) => {
+		if (!useCache) logger.debug('not using cache for devices')
+		const { deviceResults, toFetch } = await collectKnownDevices(jids, useCache)
+		return [...deviceResults, ...(await fetchUSyncDevices(toFetch, ignoreZeroDevices))]
 	}
 
 	/**
@@ -577,11 +578,16 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		return { nodes, shouldIncludeDeviceIdentity }
 	}
 
-	const relayMessageWithDevices = async (
+	type DirectDeviceLookup = {
+		jids: Set<string>
+		emptyResults: Set<string>
+	}
+
+	const relayMessageTransaction = async (
 		jid: string,
 		message: proto.IMessage,
+		msgId: string,
 		{
-			messageId: msgId,
 			participant,
 			additionalAttributes,
 			additionalNodes,
@@ -589,7 +595,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			useCachedGroupMetadata,
 			statusJidList
 		}: MessageRelayOptions,
-		resolvedDevices?: DeviceWithJid[]
+		directDeviceLookup?: DirectDeviceLookup
 	) => {
 		const meId = assertMeId(authState.creds)
 		const meLid = authState.creds.me?.lid
@@ -605,14 +611,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		const isGroupOrStatus = isGroup || isStatus
 		const finalJid = jid
 
-		msgId = msgId || generateMessageIDV2(meId)
 		useUserDevicesCache = useUserDevicesCache !== false
 		useCachedGroupMetadata = useCachedGroupMetadata !== false && !isStatus
 
 		const participants: BinaryNode[] = []
 		const destinationJid = !isStatus ? finalJid : statusJid
 		const binaryNodeContent: BinaryNode[] = []
-		const devices: DeviceWithJid[] = resolvedDevices ?? []
+		const devices: DeviceWithJid[] = []
 		let reportingMessage: proto.IMessage | undefined
 
 		const meMsg: proto.IMessage = {
@@ -640,7 +645,15 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 		let issueTcToken: (() => void) | undefined
 
-		await authState.keys.transaction(async () => {
+		const missingDevices = await authState.keys.transaction(async () => {
+			if (directDeviceLookup) {
+				const { deviceResults, toFetch } = await collectKnownDevices([...directDeviceLookup.jids], true)
+				const pending = toFetch.filter(jid => !directDeviceLookup.emptyResults.has(jid))
+				if (pending.length) return pending
+
+				devices.push(...deviceResults)
+			}
+
 			const mediaType = getMediaType(message)
 			if (mediaType) {
 				extraAttrs['mediatype'] = mediaType
@@ -798,7 +811,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						: patchedForReporting
 				}
 
-				if (resolvedDevices) {
+				if (directDeviceLookup) {
 					logger.debug(
 						{
 							deviceCount: devices.length,
@@ -1104,10 +1117,12 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 		if (issueTcToken) authState.keys.runOutsideTransaction(issueTcToken)
 
-		return msgId
+		return missingDevices
 	}
 
-	const relayMessage = (jid: string, message: proto.IMessage, options: MessageRelayOptions) => {
+	const relayMessage = async (jid: string, message: proto.IMessage, options: MessageRelayOptions) => {
+		const meId = assertMeId(authState.creds)
+		const msgId = options.messageId || generateMessageIDV2(meId)
 		if (
 			isJidGroup(jid) ||
 			isJidStatusBroadcast(jid) ||
@@ -1115,27 +1130,57 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			options.participant?.jid ||
 			options.additionalAttributes?.['category'] === 'peer'
 		) {
-			return relayMessageWithDevices(jid, message, options)
+			await relayMessageTransaction(jid, message, msgId, options)
+			return msgId
 		}
 
 		const resolveDevicesAndRelay = async () => {
-			const meId = assertMeId(authState.creds)
 			const meLid = authState.creds.me?.lid
 			const senderIdentity =
 				isLidUser(jid) && meLid
 					? jidEncode(jidDecode(meLid)!.user, 'lid')
 					: jidEncode(jidDecode(meId)!.user, 's.whatsapp.net')
-			const messageId = options.messageId || generateMessageIDV2(meId)
-			logger.debug({ msgId: messageId }, 'resolving devices for direct relay')
-			const devices = await getUSyncDevices([senderIdentity, jid], true, false)
-			return relayMessageWithDevices(jid, message, { ...options, messageId }, devices)
+			const lookup: DirectDeviceLookup = { jids: new Set([senderIdentity, jid]), emptyResults: new Set() }
+			for (let refreshes = 0; ; refreshes++) {
+				const missing = await relayMessageTransaction(jid, message, msgId, options, lookup)
+				if (!missing) return msgId
+				if (refreshes === 2) {
+					throw new Boom('Device list changed during send', { statusCode: 503 })
+				}
+
+				// Defer USync until the relay transaction has returned so other recipients can proceed.
+				logger.debug({ msgId }, 'resolving devices for direct relay')
+				const fetched = await fetchUSyncDevices(missing, false)
+				const fetchedUsers = new Set(fetched.map(device => device.user))
+				for (const target of missing) {
+					if (!fetchedUsers.has(jidDecode(target)!.user)) lookup.emptyResults.add(target)
+				}
+
+				// USync can return devices under the other address of the same user.
+				const requestedUsers = new Set([...lookup.jids].map(target => jidDecode(target)?.user))
+				for (const device of fetched) {
+					if (!requestedUsers.has(device.user)) lookup.jids.add(jidNormalizedUser(device.jid))
+				}
+			}
 		}
 
-		// A nested relay already holds the key transaction and must not wait for a send queued behind it.
+		// A nested relay already holds a key transaction and must not queue behind a send waiting to acquire it.
 		if (authState.keys.isInTransaction()) return resolveDevicesAndRelay()
 
-		// Device discovery can wait on the network. Serialize it per recipient before opening the key transaction.
-		return directRelayMutex.mutex(jidNormalizedUser(jid), resolveDevicesAndRelay)
+		// Resolve local aliases in arrival order. Release this lock as soon as the send joins its recipient's queue.
+		const { pending } = await directRelayIdentityMutex.mutex(async () => {
+			const normalized = jidNormalizedUser(jid)
+			const user = jidDecode(normalized)?.user
+			const phone =
+				(isLidUser(normalized) || isHostedLidUser(normalized)) && user
+					? await signalRepository.lidMapping.getPNForLID(jidEncode(user, 'lid'))
+					: null
+			const recipientKey =
+				isHostedPnUser(normalized) && user ? jidEncode(user, 's.whatsapp.net') : jidNormalizedUser(phone ?? normalized)
+			return { pending: directRelayMutex.mutex(recipientKey, resolveDevicesAndRelay) }
+		})
+
+		return pending
 	}
 
 	const getMessageType = (message: proto.IMessage) => {
