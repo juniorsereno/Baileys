@@ -1,8 +1,10 @@
 import { jest } from '@jest/globals'
 import { EventEmitter } from 'node:events'
 import { setTimeout as sleep } from 'node:timers/promises'
+import NodeCache from 'node-cache'
 import P from 'pino'
 import { DEFAULT_CONNECTION_CONFIG } from '../../Defaults'
+import type { CacheStore } from '../../Types'
 import { initAuthCreds } from '../../Utils/auth-utils'
 import { type BinaryNode, decodeBinaryNode, getBinaryNodeChild, getBinaryNodeChildren, jidDecode } from '../../WABinary'
 import { makeSignalStoreFixture } from '../Utils/signal-store-fixture'
@@ -94,11 +96,12 @@ class TestTransport extends EventEmitter {
 jest.unstable_mockModule('../../Socket/Client', () => ({ WebSocketClient: TestTransport }))
 const { makeMessagesSocket } = await import('../../Socket/messages-send')
 
-async function createSocket() {
+async function createSocket(userDevicesCache?: CacheStore) {
 	const creds = initAuthCreds()
 	const { store } = makeSignalStoreFixture()
 	const socket = makeMessagesSocket({
 		...DEFAULT_CONNECTION_CONFIG,
+		userDevicesCache,
 		logger: P({ level: 'silent' }),
 		auth: { creds, keys: store },
 		fireInitQueries: false,
@@ -203,6 +206,21 @@ test('a queued send uses the device cache as of the relay transaction', async ()
 		release.resolve()
 		transport.releaseDeviceLookup.resolve()
 		await Promise.allSettled(pending)
+		await socket.end(undefined)
+	}
+})
+
+test('dispatches after one device lookup with the node-cache adapter', async () => {
+	const cache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false })
+	const { socket, transport } = await createSocket(cache)
+	try {
+		transport.releaseDeviceLookup.resolve()
+		await socket.sendMessage('10001@lid', { text: 'Hello' }, { messageId: 'SEND' })
+
+		expect(transport.deviceQueries).toBe(1)
+		expect(transport.dispatches).toEqual(['SEND'])
+		expect(transport.recipients).toEqual([['10001:2@lid']])
+	} finally {
 		await socket.end(undefined)
 	}
 })

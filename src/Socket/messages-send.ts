@@ -337,13 +337,9 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			}
 
 			await devicesMutex.mutex(async () => {
-				if (userDevicesCache.mset) {
-					// if the cache supports mset, we can set all devices in one go
-					await userDevicesCache.mset(Object.entries(deviceMap).map(([key, value]) => ({ key, value })))
-				} else {
-					for (const key in deviceMap) {
-						if (deviceMap[key]) await userDevicesCache.set(key, deviceMap[key])
-					}
+				// The NodeCache implementations accept different entry formats for bulk writes.
+				for (const [user, devices] of Object.entries(deviceMap)) {
+					await userDevicesCache.set(user, devices)
 				}
 			})
 
