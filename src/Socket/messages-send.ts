@@ -56,6 +56,8 @@ import {
 	isJidBot,
 	isJidGroup,
 	isJidMetaAI,
+	isJidNewsletter,
+	isJidStatusBroadcast,
 	isLidUser,
 	isPnUser,
 	jidDecode,
@@ -119,6 +121,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 	// Prevent race conditions in Signal session encryption by user
 	const encryptionMutex = makeKeyedMutex()
+	const directRelayMutex = makeKeyedMutex()
 
 	/**
 	 * generic send receipt function
@@ -574,7 +577,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		return { nodes, shouldIncludeDeviceIdentity }
 	}
 
-	const relayMessage = async (
+	const relayMessageWithDevices = async (
 		jid: string,
 		message: proto.IMessage,
 		{
@@ -585,7 +588,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			useUserDevicesCache,
 			useCachedGroupMetadata,
 			statusJidList
-		}: MessageRelayOptions
+		}: MessageRelayOptions,
+		resolvedDevices?: DeviceWithJid[]
 	) => {
 		const meId = assertMeId(authState.creds)
 		const meLid = authState.creds.me?.lid
@@ -608,7 +612,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		const participants: BinaryNode[] = []
 		const destinationJid = !isStatus ? finalJid : statusJid
 		const binaryNodeContent: BinaryNode[] = []
-		const devices: DeviceWithJid[] = []
+		const devices: DeviceWithJid[] = resolvedDevices ?? []
 		let reportingMessage: proto.IMessage | undefined
 
 		const meMsg: proto.IMessage = {
@@ -794,46 +798,28 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						: patchedForReporting
 				}
 
-				if (!isRetryResend) {
+				if (resolvedDevices) {
+					logger.debug(
+						{
+							deviceCount: devices.length,
+							devices: devices.map(d => `${d.user}:${d.device}@${jidDecode(d.jid)?.server}`)
+						},
+						'Device enumeration complete with unified addressing'
+					)
+				} else if (!isRetryResend) {
 					const targetUserServer = isLid ? 'lid' : 's.whatsapp.net'
 					devices.push({
 						user,
 						device: 0,
-						jid: jidEncode(user, targetUserServer, 0) // rajeh, todo: this entire logic is convoluted and weird.
+						jid: jidEncode(user, targetUserServer, 0)
 					})
 
 					if (user !== ownUser) {
-						const ownUserServer = isLid ? 'lid' : 's.whatsapp.net'
-						const ownUserForAddressing = isLid && meLid ? jidDecode(meLid)!.user : jidDecode(meId)!.user
-
 						devices.push({
-							user: ownUserForAddressing,
+							user: ownUser,
 							device: 0,
-							jid: jidEncode(ownUserForAddressing, ownUserServer, 0)
+							jid: jidEncode(ownUser, targetUserServer, 0)
 						})
-					}
-
-					if (additionalAttributes?.['category'] !== 'peer') {
-						// Clear placeholders and enumerate actual devices
-						devices.length = 0
-
-						// Use conversation-appropriate sender identity
-						const senderIdentity =
-							isLid && meLid
-								? jidEncode(jidDecode(meLid)?.user!, 'lid', undefined)
-								: jidEncode(jidDecode(meId)?.user!, 's.whatsapp.net', undefined)
-
-						// Enumerate devices for sender and target with consistent addressing
-						const sessionDevices = await getUSyncDevices([senderIdentity, jid], true, false)
-						devices.push(...sessionDevices)
-
-						logger.debug(
-							{
-								deviceCount: devices.length,
-								devices: devices.map(d => `${d.user}:${d.device}@${jidDecode(d.jid)?.server}`)
-							},
-							'Device enumeration complete with unified addressing'
-						)
 					}
 				}
 
@@ -1119,6 +1105,37 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		if (issueTcToken) authState.keys.runOutsideTransaction(issueTcToken)
 
 		return msgId
+	}
+
+	const relayMessage = (jid: string, message: proto.IMessage, options: MessageRelayOptions) => {
+		if (
+			isJidGroup(jid) ||
+			isJidStatusBroadcast(jid) ||
+			isJidNewsletter(jid) ||
+			options.participant?.jid ||
+			options.additionalAttributes?.['category'] === 'peer'
+		) {
+			return relayMessageWithDevices(jid, message, options)
+		}
+
+		const resolveDevicesAndRelay = async () => {
+			const meId = assertMeId(authState.creds)
+			const meLid = authState.creds.me?.lid
+			const senderIdentity =
+				isLidUser(jid) && meLid
+					? jidEncode(jidDecode(meLid)!.user, 'lid')
+					: jidEncode(jidDecode(meId)!.user, 's.whatsapp.net')
+			const messageId = options.messageId || generateMessageIDV2(meId)
+			logger.debug({ msgId: messageId }, 'resolving devices for direct relay')
+			const devices = await getUSyncDevices([senderIdentity, jid], true, false)
+			return relayMessageWithDevices(jid, message, { ...options, messageId }, devices)
+		}
+
+		// A nested relay already holds the key transaction and must not wait for a send queued behind it.
+		if (authState.keys.isInTransaction()) return resolveDevicesAndRelay()
+
+		// Device discovery can wait on the network. Serialize it per recipient before opening the key transaction.
+		return directRelayMutex.mutex(jidNormalizedUser(jid), resolveDevicesAndRelay)
 	}
 
 	const getMessageType = (message: proto.IMessage) => {
