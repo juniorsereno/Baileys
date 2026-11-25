@@ -27,6 +27,9 @@ class TestTransport extends EventEmitter {
 	deviceLookupStarted = deferred()
 	releaseDeviceLookup = deferred()
 	deviceQueries = 0
+	deviceId = 2
+	rejectedPreKeyJids: string[] = []
+	preKeyQueries: string[][] = []
 
 	connect() {}
 
@@ -47,6 +50,15 @@ class TestTransport extends EventEmitter {
 				}
 
 				const content: BinaryNode[] = []
+
+				if (node.attrs.xmlns === 'encrypt') {
+					const users = getBinaryNodeChildren(getBinaryNodeChild(node, 'key'), 'user')
+					const jids = users.map(user => user.attrs.jid!)
+					this.preKeyQueries.push(jids)
+					if (jids.some(jid => this.rejectedPreKeyJids.includes(jid))) {
+						content.push({ tag: 'error', attrs: { code: '406', text: 'not-acceptable' } })
+					}
+				}
 
 				if (node.attrs.xmlns === 'usync') {
 					if (++this.deviceQueries === 1) {
@@ -74,7 +86,7 @@ class TestTransport extends EventEmitter {
 												{
 													tag: 'device-list',
 													attrs: {},
-													content: [{ tag: 'device', attrs: { id: '2', 'key-index': '1' } }]
+													content: [{ tag: 'device', attrs: { id: String(this.deviceId), 'key-index': '1' } }]
 												}
 											]
 										}
@@ -224,3 +236,44 @@ test('dispatches after one device lookup with the node-cache adapter', async () 
 		await socket.end(undefined)
 	}
 })
+
+test.each([
+	{ currentDevice: 2, succeeds: true },
+	{ currentDevice: 48, succeeds: false }
+])(
+	'refreshes a rejected device once and dispatches only on recovery ($currentDevice)',
+	async ({ currentDevice, succeeds }) => {
+		const { socket, transport, store } = await createSocket()
+		try {
+			await store.set({ 'lid-mapping': { '15555550101': '10001', '10001_reverse': '15555550101' } })
+			await socket.userDevicesCache.set('15555550100', [])
+			await socket.userDevicesCache.set('15555550101', [{ user: '15555550101', server: 's.whatsapp.net', device: 48 }])
+			jest.mocked(socket.signalRepository.validateSession).mockImplementation(async jid => ({
+				exists: jidDecode(jid)?.device !== 48
+			}))
+			transport.deviceId = currentDevice
+			transport.rejectedPreKeyJids = ['10001:48@lid']
+
+			const send = socket.sendMessage(phone, { text: 'Hello' }, { messageId: 'RECOVERY' })
+			await Promise.race([transport.deviceLookupStarted.promise, send])
+			await socket.sendMessage('10002@lid', { text: 'Independent send' }, { messageId: 'OTHER' })
+			expect(transport.dispatches).toEqual(['OTHER'])
+			transport.releaseDeviceLookup.resolve()
+
+			if (succeeds) {
+				await expect(send).resolves.toMatchObject({ key: { id: 'RECOVERY' } })
+				expect(transport.dispatches).toEqual(['OTHER', 'RECOVERY'])
+				expect(transport.recipients.at(-1)).toEqual(['15555550101:2@s.whatsapp.net'])
+			} else {
+				await expect(send).rejects.toMatchObject({ message: 'not-acceptable', data: 406 })
+				expect(transport.dispatches).toEqual(['OTHER'])
+			}
+
+			expect(transport.deviceQueries).toBe(1)
+			expect(transport.preKeyQueries).toEqual(succeeds ? [['10001:48@lid']] : [['10001:48@lid'], ['10001:48@lid']])
+		} finally {
+			transport.releaseDeviceLookup.resolve()
+			await socket.end(undefined)
+		}
+	}
+)
