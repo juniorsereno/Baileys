@@ -1,5 +1,5 @@
 import NodeCache from '@cacheable/node-cache'
-import { Boom } from '@hapi/boom'
+import { Boom, isBoom } from '@hapi/boom'
 import { proto } from '../../WAProto/index.js'
 import { DEFAULT_CACHE_TTLS, WA_DEFAULT_EPHEMERAL } from '../Defaults'
 import type {
@@ -69,6 +69,12 @@ import {
 } from '../WABinary'
 import { USyncQuery, USyncUser } from '../WAUSync'
 import { makeNewsletterSocket } from './newsletter'
+
+class DeviceSessionQueryRejected extends Error {
+	constructor(readonly rejection: Boom) {
+		super(rejection.message)
+	}
+}
 
 export const makeMessagesSocket = (config: SocketConfig) => {
 	const {
@@ -857,7 +863,15 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					allRecipients.push(jid)
 				}
 
-				await assertSessions(allRecipients)
+				try {
+					await assertSessions(allRecipients)
+				} catch (error) {
+					if (directDeviceLookup && isBoom(error) && error.data === 406 && error.message === 'not-acceptable') {
+						throw new DeviceSessionQueryRejected(error)
+					}
+
+					throw error
+				}
 
 				const [
 					{ nodes: meNodes, shouldIncludeDeviceIdentity: s1 },
@@ -1130,17 +1144,54 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			return msgId
 		}
 
+		const nested = authState.keys.isInTransaction()
 		const resolveDevicesAndRelay = async () => {
 			const meLid = authState.creds.me?.lid
+			const senderUsers = new Set([jidDecode(meId)?.user, meLid ? jidDecode(meLid)?.user : undefined])
 			const senderIdentity =
 				isLidUser(jid) && meLid
 					? jidEncode(jidDecode(meLid)!.user, 'lid')
 					: jidEncode(jidDecode(meId)!.user, 's.whatsapp.net')
 			const lookup: DirectDeviceLookup = { jids: new Set([senderIdentity, jid]), emptyResults: new Set() }
-			for (let refreshes = 0; ; refreshes++) {
-				const missing = await relayMessageTransaction(jid, message, msgId, options, lookup)
+			let refreshedRejectedDevices = false
+			let refreshes = 0
+			for (;;) {
+				let missing: string[] | undefined
+				try {
+					missing = await relayMessageTransaction(jid, message, msgId, options, lookup)
+				} catch (error) {
+					if (!(error instanceof DeviceSessionQueryRejected)) throw error
+					if (nested || refreshedRejectedDevices || jidDecode(jid)?.device !== undefined) throw error.rejection
+
+					// The pre-key query failed before dispatch. Refresh only this recipient outside the key transaction.
+					refreshedRejectedDevices = true
+					logger.debug({ msgId }, 'refreshing devices after a rejected pre-key query')
+					const refreshed = await fetchUSyncDevices([jidNormalizedUser(jid)], false).catch(() => {
+						logger.warn({ msgId }, 'could not refresh devices after a rejected pre-key query')
+						return []
+					})
+					if (!refreshed.length) throw error.rejection
+
+					const refreshedJids = refreshed.map(device => jidNormalizedUser(device.jid))
+					const refreshedUsers = new Set(refreshed.map(device => device.user))
+					const senderJids: string[] = []
+					await devicesMutex.mutex(async () => {
+						for (const target of lookup.jids) {
+							const user = jidDecode(target)?.user
+							if (!user) continue
+							if (senderUsers.has(user)) {
+								senderJids.push(target)
+							} else if (!refreshedUsers.has(user)) {
+								await userDevicesCache.del(user)
+							}
+						}
+					})
+					lookup.jids = new Set([...senderJids, ...refreshedJids])
+					continue
+				}
+
 				if (!missing) return msgId
-				if (refreshes === 2) {
+				if (refreshes++ === 2) {
 					throw new Boom('Device list changed during send', { statusCode: 503 })
 				}
 
@@ -1161,7 +1212,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		}
 
 		// A nested relay already holds a key transaction and must not queue behind a send waiting to acquire it.
-		if (authState.keys.isInTransaction()) return resolveDevicesAndRelay()
+		if (nested) return resolveDevicesAndRelay()
 
 		// Resolve local aliases in arrival order. Release this lock as soon as the send joins its recipient's queue.
 		const { pending } = await directRelayIdentityMutex.mutex(async () => {
