@@ -434,6 +434,7 @@ export const makeSocket = (config: SocketConfig) => {
 	let epoch = 1
 	let keepAliveReq: NodeJS.Timeout
 	let qrTimer: NodeJS.Timeout
+	let renderCurrentPairingQR: (() => void) | undefined
 	let closed = false
 
 	const socketEndHandlers: Array<(error: Error | undefined) => void | Promise<void>> = []
@@ -700,6 +701,7 @@ export const makeSocket = (config: SocketConfig) => {
 
 		clearInterval(keepAliveReq)
 		clearTimeout(qrTimer)
+		renderCurrentPairingQR = undefined
 
 		ws.removeAllListeners('close')
 		ws.removeAllListeners('open')
@@ -949,7 +951,7 @@ export const makeSocket = (config: SocketConfig) => {
 		const refNodes = getBinaryNodeChildren(pairDeviceNode, 'ref')
 		const noiseKeyB64 = Buffer.from(creds.noiseKey.public).toString('base64')
 		const identityKeyB64 = Buffer.from(creds.signedIdentityKey.public).toString('base64')
-		const advB64 = creds.advSecretKey
+		clearTimeout(qrTimer)
 
 		let qrMs = qrTimeout || 60_000 // time to let a QR live
 		const genPairQR = () => {
@@ -964,9 +966,12 @@ export const makeSocket = (config: SocketConfig) => {
 			}
 
 			const ref = (refNode.content as Buffer).toString('utf-8')
-			const qr = buildPairingQRData(ref, noiseKeyB64, identityKeyB64, advB64, browser)
+			renderCurrentPairingQR = () => {
+				const qr = buildPairingQRData(ref, noiseKeyB64, identityKeyB64, creds.advSecretKey, browser)
+				ev.emit('connection.update', { qr })
+			}
 
-			ev.emit('connection.update', { qr })
+			renderCurrentPairingQR()
 
 			qrTimer = setTimeout(genPairQR, qrMs)
 			qrMs = qrTimeout || 20_000 // shorter subsequent qrs
@@ -974,10 +979,29 @@ export const makeSocket = (config: SocketConfig) => {
 
 		genPairQR()
 	})
+
+	ws.on('CB:notification,type:companion_reg_refresh', (node: BinaryNode) => {
+		if (creds.me || closed) {
+			return
+		}
+
+		if (!getBinaryNodeChild(node, 'companion_reg_refresh') && !getBinaryNodeChild(node, 'pair-device-rotate-qr')) {
+			logger.warn({ id: node.attrs.id }, 'ignoring companion registration refresh without a recognized child')
+			return
+		}
+
+		creds.advSecretKey = randomBytes(32).toString('base64')
+		ev.emit('creds.update', { advSecretKey: creds.advSecretKey })
+		// The active reference remains valid until its existing timer expires.
+		renderCurrentPairingQR?.()
+	})
+
 	// device paired for the first time
 	// if device pairs successfully, the server asks to restart the connection
 	ws.on('CB:iq,,pair-success', async (stanza: BinaryNode) => {
 		logger.debug('pair success recv')
+		clearTimeout(qrTimer)
+		renderCurrentPairingQR = undefined
 		try {
 			updateServerTimeOffset(stanza)
 			const { reply, creds: updatedCreds } = configureSuccessfulPairing(stanza, creds)
